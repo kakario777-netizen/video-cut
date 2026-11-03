@@ -1,0 +1,126 @@
+name: 윈도우 프로그램 빌드
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 버전 정하기
+        id: ver
+        shell: bash
+        run: |
+          V="1.0.${{ github.run_number }}"
+          echo "ver=$V" >> "$GITHUB_OUTPUT"
+          echo "VERSION = \"$V\"" > version.py
+
+      - name: FFmpeg 내려받기 (그래픽카드 인코딩 포함 빌드)
+        shell: pwsh
+        run: |
+          $h = @{ Authorization = "Bearer ${{ github.token }}"; "User-Agent" = "video-cut-ci" }
+          $rel = Invoke-RestMethod "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" -Headers $h
+          $names = $rel.assets | ForEach-Object { $_.name }
+          # 7.1 버전 우선(그래픽 드라이버 요구 버전이 낮음), 없으면 다른 정식 버전, 마지막으로 master
+          $asset = $rel.assets | Where-Object { $_.name -like "ffmpeg-n7.1*-win64-gpl-7.1.zip" } | Select-Object -First 1
+          if (!$asset) { $asset = $rel.assets | Where-Object { $_.name -like "ffmpeg-n*-win64-gpl-*.zip" -and $_.name -notlike "*shared*" } | Sort-Object name | Select-Object -First 1 }
+          if (!$asset) { $asset = $rel.assets | Where-Object { $_.name -eq "ffmpeg-master-latest-win64-gpl.zip" } | Select-Object -First 1 }
+          if (!$asset) { $names; Write-Error "FFmpeg 파일을 못 찾음"; exit 1 }
+          Write-Host "FFmpeg: $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile ff.zip
+          Expand-Archive ff.zip -DestinationPath ffx
+          $bin = Get-ChildItem ffx -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force ffmpeg | Out-Null
+          foreach ($n in "ffmpeg.exe","ffprobe.exe","ffplay.exe") { Copy-Item (Join-Path $bin.DirectoryName $n) ffmpeg\ }
+          $lic = Get-ChildItem ffx -Recurse -Filter LICENSE.txt | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName ffmpeg\FFmpeg_LICENSE.txt }
+          .\ffmpeg\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          .\ffmpeg\ffmpeg.exe -hide_banner -encoders | Select-String "hevc"
+
+      - name: 라이브러리 설치
+        run: pip install -r requirements.txt nuitka ordered-set zstandard
+
+      - name: 동작 확인 (소스)
+        run: python app.py --selftest
+        timeout-minutes: 8
+
+      - name: Nuitka 캐시
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka
+          key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: C로 컴파일 (Nuitka, 폴더형)
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.ver }}"
+          python -m nuitka --standalone --assume-yes-for-downloads --msvc=latest `
+            --enable-plugin=tk-inter --windows-console-mode=disable `
+            --include-package=tkinterdnd2 `
+            --windows-icon-from-ico=icon.ico --include-data-files=icon.ico=icon.ico `
+            --output-dir=build --output-filename=VideoCut.exe `
+            --company-name=kakario777 --product-name=VideoCut `
+            --file-description="VideoCut" --copyright=kakario777 `
+            --file-version="$v.0" --product-version="$v.0" `
+            app.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Move-Item build\app.dist dist\VideoCut
+          $dnd = python -c "import tkinterdnd2, os; print(os.path.join(os.path.dirname(tkinterdnd2.__file__), 'tkdnd'))"
+          Copy-Item -Recurse -Force $dnd dist\VideoCut\tkinterdnd2\tkdnd
+          Copy-Item -Recurse -Force ffmpeg dist\VideoCut\ffmpeg
+          Get-ChildItem dist\VideoCut | Select-Object -First 15 | Format-Table Name, Length
+
+      - name: 동작 확인 (완성된 프로그램)
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          Start-Process -FilePath "dist\VideoCut\VideoCut.exe" -ArgumentList "--selftest","--selftest-out","$log" -Wait
+          Get-Content $log -Encoding utf8
+          if (!(Select-String -Path $log -Pattern "selftest ok" -Quiet)) { Write-Error "완성된 프로그램 점검 실패"; exit 1 }
+          if (!(Select-String -Path $log -Pattern "ui ok" -Quiet)) { Write-Error "화면 점검 실패"; exit 1 }
+          if (!(Select-String -Path $log -Pattern "dnd: True" -Quiet)) { Write-Error "끌어다 놓기 부품 누락"; exit 1 }
+
+      - name: 설치 파일 만들기
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.ver }}" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 설치 확인
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "installer_out\VideoCut_Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
+          $exe = "$env:ProgramFiles\VideoCut\VideoCut.exe"
+          if (!(Test-Path $exe)) { Write-Error "설치 실패"; exit 1 }
+          if (!(Test-Path "$env:ProgramFiles\VideoCut\ffmpeg\ffmpeg.exe")) { Write-Error "FFmpeg 누락"; exit 1 }
+          if (!(Test-Path "$env:PUBLIC\Desktop\비디오 컷.lnk")) { Write-Error "바로가기 없음"; exit 1 }
+          (Get-Item "installer_out\VideoCut_Setup.exe").Length / 1MB
+
+      - name: 릴리스에 올리기
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.ver }}
+          name: 비디오 컷 v${{ steps.ver.outputs.ver }}
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            ---
+            처음 설치: VideoCut_Setup.exe 를 받아 실행 → Program Files 에 설치되고 바탕화면에 '비디오 컷' 바로가기가 생깁니다.
+            이후 업데이트: 프로그램 오른쪽 위 '업데이트 확인'.
+          files: |
+            installer_out/VideoCut_Setup.exe
