@@ -9,7 +9,7 @@ import numpy as np
 
 import fftools
 
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 W, H = 320, 180          # 분석용 크기
 PIX_THR = 10             # 이 이상 밝기가 바뀐 화소를 '변한 화소'로 셈
 
@@ -60,21 +60,37 @@ def cache_path(path, fps):
     return os.path.join(cache_dir(), hashlib.sha1(key.encode("utf-8")).hexdigest()[:20] + ".npz")
 
 
-def _decode_cmd(path, fps, mode):
+TW, TH = 80, 45           # 타임라인 썸네일 크기
+
+
+def thumb_interval(duration):
+    """타임라인 썸네일 간격(초) — 최대 약 2500장"""
+    return max(2.0, round(duration / 2500.0, 1))
+
+
+def _decode_cmd(path, fps, mode, tiv, thumb_file):
     base = [fftools.FFMPEG, "-v", "error", "-nostdin"]
-    out = ["-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    tf = f"fps={1.0 / tiv:.6f},scale={TW}:{TH}:flags=bilinear,format=rgb24"
+    sw = f"fps={fps},scale={W}:{H}:flags=bilinear"
     if mode == "cuda_scale":
-        return base + ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", path,
-                       "-vf", f"fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"] + out
-    if mode == "cuda":
-        return base + ["-hwaccel", "cuda", "-i", path,
-                       "-vf", f"fps={fps},scale={W}:{H}:flags=bilinear,format=gray"] + out
-    if mode == "d3d11":
-        return base + ["-hwaccel", "d3d11va", "-i", path,
-                       "-vf", f"fps={fps},scale={W}:{H}:flags=bilinear,format=gray"] + out
-    # cpu: 루프 필터를 건너뛰어 디코딩을 빠르게 (분석용이라 화질 영향 없음)
-    return base + ["-threads", "0", "-skip_loop_filter", "all", "-i", path,
-                   "-vf", f"fps={fps},scale={W}:{H}:flags=bilinear,format=gray"] + out
+        pre = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        head = f"[0:v]fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12"
+    elif mode == "cuda":
+        pre = ["-hwaccel", "cuda"]
+        head = f"[0:v]{sw}"
+    elif mode == "d3d11":
+        pre = ["-hwaccel", "d3d11va"]
+        head = f"[0:v]{sw}"
+    else:
+        # cpu: 루프 필터를 건너뛰어 디코딩을 빠르게 (분석용이라 화질 영향 없음)
+        pre = ["-threads", "0", "-skip_loop_filter", "all"]
+        head = f"[0:v]{sw}"
+    if mode != "cuda_scale":
+        head += ",format=yuv420p"   # split 앞에서 컬러 유지 (gray 로 묶이지 않게)
+    graph = f"{head},split[a][b];[a]format=gray[g];[b]{tf}[c]"
+    return base + pre + ["-i", path, "-filter_complex", graph,
+                         "-map", "[g]", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+                         "-map", "[c]", "-f", "rawvideo", "-pix_fmt", "rgb24", "-y", thumb_file]
 
 
 def _features(frames, prev):
@@ -100,22 +116,32 @@ def _features(frames, prev):
 class Analysis:
     """특징 기록 (프레임마다 하나씩)"""
 
-    def __init__(self, fps, chg, luma, bright, sharp, mode=""):
+    def __init__(self, fps, chg, luma, bright, sharp, mode="", thumbs=None, tiv=2.0):
         self.fps = float(fps)
         self.chg, self.luma, self.bright, self.sharp = chg, luma, bright, sharp
         self.mode = mode
+        self.thumbs = thumbs if thumbs is not None else np.zeros((0, TH, TW, 3), np.uint8)
+        self.tiv = float(tiv)
+
+    def thumb(self, t):
+        """t초에 가까운 타임라인 썸네일 (numpy HxWx3) 또는 None"""
+        n = len(self.thumbs)
+        if not n:
+            return None
+        return self.thumbs[min(n - 1, max(0, int(t / self.tiv)))]
 
     def __len__(self):
         return len(self.chg)
 
     def save(self, p):
         np.savez_compressed(p, fps=self.fps, chg=self.chg, luma=self.luma, bright=self.bright, sharp=self.sharp,
-                            mode=self.mode)
+                            mode=self.mode, thumbs=self.thumbs, tiv=self.tiv)
 
     @staticmethod
     def load(p):
         z = np.load(p)
-        return Analysis(float(z["fps"]), z["chg"], z["luma"], z["bright"], z["sharp"], str(z["mode"]))
+        return Analysis(float(z["fps"]), z["chg"], z["luma"], z["bright"], z["sharp"], str(z["mode"]),
+                        z["thumbs"], float(z["tiv"]))
 
 
 def analyze(path, info, settings, progress=None, job=None, use_cache=True):
@@ -147,7 +173,9 @@ def analyze(path, info, settings, progress=None, job=None, use_cache=True):
 
 def _run_decode(path, info, fps, mode, progress, job):
     """성공 시 Analysis, 실패 시 오류 문자열"""
-    cmd = _decode_cmd(path, fps, mode)
+    tiv = thumb_interval(info["duration"])
+    thumb_file = os.path.join(cache_dir(), f"_thumbs_{os.getpid()}.raw")
+    cmd = _decode_cmd(path, fps, mode, tiv, thumb_file)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                          creationflags=fftools.NOWIN, bufsize=W * H * 8)
     if job is not None:
@@ -194,7 +222,19 @@ def _run_decode(path, info, fps, mode, progress, job):
     if n == 0:
         return f"[{mode}] 프레임을 하나도 읽지 못함"
     cat = [np.concatenate(x) for x in parts]
-    return Analysis(fps, *cat, mode=mode)
+    thumbs = None
+    try:
+        raw = np.fromfile(thumb_file, dtype=np.uint8)
+        k = len(raw) // (TW * TH * 3)
+        thumbs = raw[:k * TW * TH * 3].reshape(k, TH, TW, 3).copy()
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(thumb_file)
+        except OSError:
+            pass
+    return Analysis(fps, *cat, mode=mode, thumbs=thumbs, tiv=tiv)
 
 
 def _mode_name(mode):
