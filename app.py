@@ -1880,6 +1880,12 @@ def _ui_test(app, root):
 
 
 def main():
+    if "--selftest" in sys.argv:
+        # 점검은 실제 설정·목록을 건드리지 않게 임시 폴더에서
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="videocut_cfg_")
+        os.environ["APPDATA"] = tmp
+        os.environ["LOCALAPPDATA"] = tmp
     root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     app = App(root)
     if "--updated" in sys.argv:
