@@ -180,8 +180,16 @@ class App:
         self.analysis = None
         self.segs = []
         self.sel = None
-        self.job = None
-        self.busy = False
+        self.job = None          # 내보내기 작업
+        self.fg_job = None       # 지금 보는 영상 분석
+        self.exporting = False
+        self.items = []          # 영상 목록 [{path, include, reviewed, state, pct, dur}]
+        self.aw_queue = []       # 백그라운드 분석 대기
+        self.aw_lock = threading.Lock()
+        self.aw_thread = None
+        self.aw_job = None
+        self.aw_current = None
+        self.fg_path = None
         self.q = []
         self.view = (0.0, 1.0)
         self.t = 0.0
@@ -208,6 +216,7 @@ class App:
         root.after(100, self._poll)
         root.after(16, self._display_loop)
         threading.Thread(target=self._quiet_check, daemon=True).start()
+        root.after(300, self._restore_queue)
         if not fftools.available():
             self.status("FFmpeg 를 찾지 못했습니다. 프로그램을 다시 설치해주세요.")
 
@@ -220,10 +229,10 @@ class App:
         # 위 막대
         top = ttk.Frame(r, style="Panel.TFrame", padding=(10, 7))
         top.grid(row=0, column=0, sticky="ew")
-        btn(top, "영상 열기", self.open_file, "TButton").pack(side="left")
-        self.file_lbl = ttk.Label(top, text="영상 파일을 열거나 이 창에 끌어다 놓으세요.", style="Sub.TLabel")
+        btn(top, "영상 추가", self.open_file, "TButton").pack(side="left")
+        self.file_lbl = ttk.Label(top, text="영상 파일을 추가하거나 이 창에 끌어다 놓으세요. (여러 개 가능)", style="Sub.TLabel")
         self.file_lbl.pack(side="left", padx=14)
-        self.export_btn = btn(top, "내보내기", self.start_export, "Accent.TButton")
+        self.export_btn = btn(top, "체크한 영상 모두 내보내기", self.export_all, "Accent.TButton")
         self.export_btn.pack(side="right")
         btn(top, "설정", lambda: SettingsDialog(self), "TButton").pack(side="right", padx=6)
         self.upd_btn = btn(top, "업데이트 확인", lambda: UpdateDialog(self), "TButton")
@@ -285,16 +294,48 @@ class App:
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self._opt_changed(restart=True))
 
-        # 오른쪽 패널
-        rp = ttk.Frame(right, style="Panel.TFrame", padding=(12, 10))
-        rp.pack(fill="both", expand=True)
+        # 오른쪽 패널: 영상 목록 / 잘라낼 구간 / 내보내기
+        rpw = ttk.PanedWindow(right, orient="vertical")
+        rpw.pack(fill="both", expand=True)
+        qp = ttk.Frame(rpw, style="Panel.TFrame", padding=(12, 10, 12, 6))
+        rp = ttk.Frame(rpw, style="Panel.TFrame", padding=(12, 8, 12, 10))
+        rpw.add(qp, weight=2)
+        rpw.add(rp, weight=3)
+        qh = ttk.Frame(qp, style="Panel.TFrame")
+        qh.pack(fill="x")
+        ttk.Label(qh, text="영상 목록", style="Head.TLabel").pack(side="left")
+        self.q_lbl = ttk.Label(qh, text="", style="Sub.TLabel")
+        self.q_lbl.pack(side="left", padx=8)
+        qf = ttk.Frame(qp, style="Panel.TFrame")
+        qf.pack(fill="both", expand=True, pady=(6, 0))
+        qcols = ("chk", "name", "len", "state")
+        self.qtree = ttk.Treeview(qf, columns=qcols, show="headings", selectmode="browse", height=4)
+        for c, t, w in zip(qcols, ("출력", "파일", "길이", "상태"), (44, 170, 66, 96)):
+            self.qtree.heading(c, text=t)
+            self.qtree.column(c, width=w, anchor="w" if c == "name" else "center", stretch=c == "name")
+        qsb = ttk.Scrollbar(qf, orient="vertical", command=self.qtree.yview)
+        self.qtree.configure(yscrollcommand=qsb.set)
+        self.qtree.pack(side="left", fill="both", expand=True)
+        qsb.pack(side="right", fill="y")
+        self.qtree.tag_configure("off", foreground="#6f7680")
+        self.qtree.tag_configure("done", foreground="#6fd3a3")
+        self.qtree.tag_configure("err", foreground="#ff7b85")
+        self.qtree.tag_configure("cur", font=FONT_B)
+        self.qtree.bind("<ButtonRelease-1>", self._qtree_click)
+        self.qtree.bind("<<TreeviewSelect>>", self._qtree_sel)
+        qb = ttk.Frame(qp, style="Panel.TFrame")
+        qb.pack(fill="x", pady=(6, 0))
+        btn(qb, "영상 추가", self.open_file).pack(side="left")
+        btn(qb, "빼기", self.remove_item).pack(side="left", padx=4)
+        btn(qb, "완료 지우기", self.clear_done).pack(side="left")
+        ttk.Label(qb, text="출력 칸 클릭 = 체크/해제", style="Sub.TLabel").pack(side="right")
         ttk.Label(rp, text="잘라낼 구간", style="Head.TLabel").pack(anchor="w")
         self.sum_lbl = ttk.Label(rp, text="영상을 열면 자동으로 찾습니다.", style="Sub.TLabel", justify="left")
         self.sum_lbl.pack(anchor="w", pady=(2, 6))
         tf = ttk.Frame(rp, style="Panel.TFrame")
         tf.pack(fill="both", expand=True)
         cols = ("no", "kind", "start", "len", "act")
-        self.tree = ttk.Treeview(tf, columns=cols, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(tf, columns=cols, show="headings", selectmode="browse", height=4)
         for c, t, w in zip(cols, ("#", "종류", "시작", "길이", "처리"), (38, 84, 92, 64, 60)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="center", stretch=c == "kind")
@@ -325,10 +366,23 @@ class App:
         self.q_var = tk.IntVar(value=int(self.s.get("quality", 24)))
         ttk.Spinbox(qf, from_=16, to=36, textvariable=self.q_var, width=5).pack(side="left")
         ttk.Label(qf, text="낮을수록 좋음 (인코딩 때만)", style="Sub.TLabel").pack(side="left", padx=6)
-        ttk.Label(ex, text="저장", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
-        self.out_var = tk.StringVar()
-        ttk.Entry(ex, textvariable=self.out_var).grid(row=2, column=1, sticky="ew", padx=(8, 4), pady=2)
-        btn(ex, "변경", self.pick_out).grid(row=2, column=2)
+        ttk.Label(ex, text="출력 폴더", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
+        self.dir_var = tk.StringVar(value=self.s.get("out_dir", ""))
+        ttk.Entry(ex, textvariable=self.dir_var).grid(row=2, column=1, sticky="ew", padx=(8, 4), pady=2)
+        btn(ex, "선택", self.pick_dir).grid(row=2, column=2)
+        ttk.Label(ex, text="비워두면 원본과 같은 폴더 · 파일 이름 뒤에 '_편집'", style="Sub.TLabel").grid(
+            row=3, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        eb = ttk.Frame(ex, style="Panel.TFrame")
+        eb.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.one_btn = btn(eb, "지금 보는 영상만 내보내기", self.export_current)
+        self.one_btn.pack(side="left")
+        btn(eb, "원본 폴더로", lambda: self.dir_var.set("")).pack(side="right")
+        # 내보내기 설정은 항상 보이게: 아래부터 채우고 목록이 남는 공간을 씀
+        for w in (tf, rb, ex):
+            w.pack_forget()
+        ex.pack(side="bottom", fill="x", pady=(12, 0))
+        rb.pack(side="bottom", fill="x", pady=(8, 0))
+        tf.pack(fill="both", expand=True)
 
         # 타임라인
         tlw = ttk.Frame(r, style="TFrame")
@@ -403,33 +457,50 @@ class App:
 
     def _handle(self, m):
         kind = m[0]
-        if kind == "prog":
+        if kind == "aprog":
+            path, r, msg = m[1], m[2], m[3]
+            it = self._item(path)
+            if it:
+                it["state"], it["pct"] = "analyzing", r
+                self._qrow(it)
+            if path == self.path:
+                self.prog.config(value=int(r * 1000))
+                self.status(msg)
+        elif kind == "bprog":
             self.prog.config(value=int(m[1] * 1000))
             self.status(m[2])
         elif kind == "probed":
-            self._on_probed(m[1])
+            self._on_probed(m[1], m[2])
         elif kind == "analyzed":
             self._on_analyzed(*m[1:])
-        elif kind == "fail":
-            self._set_busy(False)
-            self.prog.config(value=0)
-            self.status(m[1].splitlines()[0])
-            if m[1] != "취소됨":
-                messagebox.showerror(APP_NAME, m[1])
-        elif kind == "exported":
-            self._set_busy(False)
-            self.prog.config(value=1000)
-            out, msg = m[1], m[2]
-            self.status(msg.splitlines()[0])
-            if messagebox.askyesno(APP_NAME, msg + f"\n\n{out}\n\n저장된 폴더를 열까요?"):
-                self.reveal(out)
+        elif kind == "afail":
+            path, msg = m[1], m[2]
+            it = self._item(path)
+            if it:
+                it["state"] = "error" if msg != "취소됨" else "wait"
+                it["msg"] = msg
+                self._qrow(it)
+            if path == self.path:
+                self.prog.config(value=0)
+                self.status(msg.splitlines()[0])
+                if msg != "취소됨":
+                    messagebox.showerror(APP_NAME, f"{os.path.basename(path)}\n\n{msg}")
+        elif kind == "item":
+            it = self._item(m[1])
+            if it:
+                it.update(m[2])
+                self._qrow(it)
+        elif kind == "batch_done":
+            self._batch_done(m[1], m[2])
         elif kind == "upd":
             self.upd_btn.config(text=m[1])
 
-    def _set_busy(self, b):
-        self.busy = b
-        self.export_btn.config(state="disabled" if b else "normal")
-        self.cancel_btn.config(state="normal" if b else "disabled")
+    def _set_exporting(self, b):
+        self.exporting = b
+        st = "disabled" if b else "normal"
+        self.export_btn.config(state=st)
+        self.one_btn.config(state=st)
+        self.cancel_btn.config(state="normal" if b else ("normal" if self.fg_job else "disabled"))
 
     def _dur(self):
         return self.info["duration"] if self.info else 1.0
@@ -448,7 +519,7 @@ class App:
         self.s["sound"] = self.sound_var.get()
         self.s["speed"] = self.speed_var.get()
         self.s["preview_q"] = self.pq_var.get()
-        save_settings(self.s)
+        self._save_settings_only()
         if self.player.playing and restart:
             self.play(self.t)
         elif self.player.playing and not self.sound_var.get():
@@ -464,75 +535,318 @@ class App:
         files = [f for f in self.root.tk.splitlist(e.data) if os.path.isfile(f)]
         vids = [f for f in files if f.lower().endswith(VIDEO_EXT)] or files
         if vids:
-            self.open_file(vids[0])
+            self.add_files(vids)
 
     def open_file(self, path=None):
-        if self.busy:
-            messagebox.showinfo(APP_NAME, "작업이 끝난 뒤 열어주세요.")
+        if path:
+            self.add_files([path])
             return
-        if not path:
-            path = filedialog.askopenfilename(
-                title="영상 열기", initialdir=self.s.get("last_dir") or None,
-                filetypes=[("영상 파일", " ".join("*" + x for x in VIDEO_EXT)), ("모든 파일", "*.*")])
-        if not path:
+        paths = filedialog.askopenfilenames(
+            title="영상 추가 (여러 개 선택 가능)", initialdir=self.s.get("last_dir") or None,
+            filetypes=[("영상 파일", " ".join("*" + x for x in VIDEO_EXT)), ("모든 파일", "*.*")])
+        if paths:
+            self.add_files(list(paths))
+
+    # ════════════════ 영상 목록 ════════════════
+    def _item(self, path):
+        return next((it for it in self.items if it["path"] == path), None)
+
+    def _cached(self, path):
+        try:
+            return os.path.isfile(analyzer.cache_path(path, int(self.s.get("analysis_fps", 5))))
+        except OSError:
+            return False
+
+    def add_files(self, paths, select=True):
+        added = []
+        for p in paths:
+            p = os.path.normpath(os.path.abspath(p))
+            if not os.path.isfile(p) or self._item(p):
+                continue
+            it = {"path": p, "include": True, "reviewed": False, "state": "wait", "pct": 0.0, "dur": None}
+            if self._cached(p):
+                it["state"] = "ready"
+            self.items.append(it)
+            added.append(it)
+            self.s["last_dir"] = os.path.dirname(p)
+        for it in added:
+            self.qtree.insert("", "end", iid=it["path"], values=("", "", "", ""))
+            self._qrow(it)
+            threading.Thread(target=self._probe_len, args=(it["path"],), daemon=True).start()
+            if it["state"] == "wait":
+                self.queue_analysis(it["path"])
+        self._save_queue()
+        if added and select and (self.path is None or len(added) == len(self.items)):
+            self.switch_to(added[0]["path"])
+        elif added:
+            self.status(f"영상 {len(added)}개를 목록에 추가했습니다. 뒤에서 차례로 분석합니다.")
+
+    def _probe_len(self, path):
+        try:
+            d = fftools.probe(path)["duration"]
+            self.post("item", path, {"dur": d})
+        except Exception:
+            pass
+
+    def _qrow(self, it):
+        if not self.qtree.exists(it["path"]):
+            return
+        st = it["state"]
+        if st == "wait":
+            txt = "분석 대기"
+        elif st == "analyzing":
+            txt = f"분석 {int(it.get('pct', 0) * 100)}%"
+        elif st == "ready":
+            txt = "확인함" if it.get("reviewed") else "미확인"
+        elif st == "exporting":
+            txt = f"내보내는 중 {int(it.get('pct', 0) * 100)}%"
+        elif st == "done":
+            txt = "완료"
+        else:
+            txt = "오류"
+        tags = []
+        if not it["include"]:
+            tags.append("off")
+        if st == "done":
+            tags.append("done")
+        if st == "error":
+            tags.append("err")
+        if it["path"] == self.path:
+            tags.append("cur")
+        name = os.path.basename(it["path"])
+        self.qtree.item(it["path"], tags=tags, values=(
+            "✔" if it["include"] else "—", ("▶ " if it["path"] == self.path else "") + name,
+            fftools.fmt_time(it["dur"]) if it.get("dur") else "", txt))
+        n_on = sum(1 for x in self.items if x["include"])
+        self.q_lbl.config(text=f"{len(self.items)}개 · 출력 체크 {n_on}개")
+
+    def _qtree_click(self, e):
+        if self.qtree.identify_region(e.x, e.y) != "cell" or self.qtree.identify_column(e.x) != "#1":
+            return
+        row = self.qtree.identify_row(e.y)
+        it = self._item(row)
+        if it:
+            it["include"] = not it["include"]
+            self._qrow(it)
+            self._save_queue()
+
+    def _qtree_sel(self, _e=None):
+        sel = self.qtree.selection()
+        if sel and sel[0] != self.path:
+            self.switch_to(sel[0])
+
+    def remove_item(self):
+        sel = self.qtree.selection()
+        if not sel:
+            return
+        path = sel[0]
+        it = self._item(path)
+        if not it or it["state"] == "exporting":
+            return
+        idx = self.items.index(it)
+        self.items.remove(it)
+        with self.aw_lock:
+            if path in self.aw_queue:
+                self.aw_queue.remove(path)
+        if self.aw_current == path and self.aw_job:
+            self.aw_job.cancel()
+        self.qtree.delete(path)
+        self._save_queue()
+        if path == self.path:
+            if self.items:
+                self.switch_to(self.items[min(idx, len(self.items) - 1)]["path"])
+            else:
+                self._clear_editor()
+        for x in self.items:
+            self._qrow(x)
+
+    def clear_done(self):
+        for it in [x for x in self.items if x["state"] == "done"]:
+            if it["path"] == self.path:
+                continue
+            self.items.remove(it)
+            self.qtree.delete(it["path"])
+        self._save_queue()
+        for x in self.items:
+            self._qrow(x)
+
+    def _save_queue(self):
+        self.s["queue"] = [{"path": it["path"], "include": it["include"], "reviewed": it.get("reviewed", False),
+                            "done": it["state"] == "done"} for it in self.items]
+        self.s["current"] = self.path
+        self._save_settings_only()
+
+    def _restore_queue(self):
+        q = [x for x in self.s.get("queue", []) if os.path.isfile(x.get("path", ""))]
+        if not q:
+            return
+        self.add_files([x["path"] for x in q], select=False)
+        for x in q:
+            it = self._item(os.path.normpath(os.path.abspath(x["path"])))
+            if it:
+                it["include"] = x.get("include", True)
+                it["reviewed"] = x.get("reviewed", False)
+                if x.get("done") and it["state"] == "ready":
+                    it["state"] = "done"
+                self._qrow(it)
+        cur = self.s.get("current")
+        target = self._item(os.path.normpath(cur)) if cur else None
+        self.switch_to((target or self.items[0])["path"])
+
+    def _clear_editor(self):
+        self.pause()
+        self.path = self.info = self.analysis = None
+        self.segs, self.sel, self.t = [], None, 0.0
+        self.last_img = None
+        self.pv.itemconfig(self.pv_img, image="")
+        self.pv.itemconfig(self.pv_msg, state="normal")
+        for it in (self.pv_badge_bg, self.pv_badge, self.pv_frame):
+            self.pv.itemconfig(it, state="hidden")
+        self.file_lbl.config(text="영상 파일을 추가하거나 이 창에 끌어다 놓으세요. (여러 개 가능)", foreground=SUB)
+        self.sum_lbl.config(text="")
+        self.refresh()
+        self._update_time()
+
+    # ════════════════ 분석 (백그라운드 + 지금 보는 영상) ════════════════
+    def queue_analysis(self, path):
+        with self.aw_lock:
+            if path in self.aw_queue or path == self.aw_current:
+                return
+            self.aw_queue.append(path)
+            if self.aw_thread is None or not self.aw_thread.is_alive():
+                self.aw_thread = threading.Thread(target=self._aw_loop, daemon=True)
+                self.aw_thread.start()
+
+    def _aw_loop(self):
+        while True:
+            with self.aw_lock:
+                if not self.aw_queue:
+                    self.aw_current = None
+                    return
+                path = self.aw_queue.pop(0)
+                self.aw_current = path
+                self.aw_job = fftools.Job()
+                job = self.aw_job
+            if path != self.fg_path:
+                self._analyze_work(path, job, foreground=False)
+            with self.aw_lock:
+                self.aw_current = None
+
+    def _analyze_work(self, path, job, foreground, use_cache=True, keep_saved=True):
+        try:
+            info = fftools.probe(path)
+            if foreground:
+                self.post("probed", path, info)
+            a = analyzer.analyze(path, info, dict(self.s), progress=lambda r, msg: self.post("aprog", path, r, msg),
+                                 job=job, use_cache=use_cache)
+            segs, restored = None, False
+            sf = segs_file(path, int(a.fps))
+            if keep_saved and os.path.isfile(sf):
+                try:
+                    with open(sf, encoding="utf-8") as f:
+                        segs = json.load(f)
+                    restored = True
+                except Exception:
+                    segs = None
+            if segs is None:
+                segs = analyzer.detect(a, info["duration"], self.s)
+                try:
+                    with open(sf, "w", encoding="utf-8") as f:
+                        json.dump(segs, f, ensure_ascii=False)
+                except Exception:
+                    pass
+            self.post("analyzed", path, info, a, segs, restored)
+        except Exception as e:
+            self.post("afail", path, "취소됨" if job.cancelled else str(e))
+
+    def switch_to(self, path, use_cache=True, keep_saved=True):
+        """목록의 영상을 편집 화면에 띄움"""
+        it = self._item(path)
+        if not it:
             return
         self.pause()
-        self.s["last_dir"] = os.path.dirname(path)
         self._save_state()
+        old = self.path
         self.path = path
         self.info = None
         self.analysis = None
         self.segs = []
         self.sel = None
         self.t = 0.0
+        self.last_img = None
         self.refresh()
+        self.sum_lbl.config(text="분석 중...")
         self.file_lbl.config(text=os.path.basename(path), foreground=TEXT)
-        self.out_var.set(exporter.default_out(path))
-        self._start_analyze(path, use_cache=True)
-
-    def _start_analyze(self, path, use_cache=True, keep_saved=True):
-        self._set_busy(True)
-        self.job = fftools.Job()
-        job = self.job
-        settings = dict(self.s)
+        if self.qtree.selection() != (path,):
+            self.qtree.selection_set(path)
+        self.qtree.see(path)
+        for x in self.items:
+            if x["path"] in (old, path):
+                self._qrow(x)
+        self.s["current"] = path
+        # 이미 백그라운드에서 분석 중이면 그 결과를 기다림, 아니면 바로 따로 분석
+        with self.aw_lock:
+            if path in self.aw_queue:
+                self.aw_queue.remove(path)
+            waiting = path == self.aw_current and use_cache
+        if self.fg_job:
+            self.fg_job.cancel()
+        threading.Thread(target=self._probe_only, args=(path,), daemon=True).start()
+        if waiting:
+            self.status("뒤에서 분석 중인 영상입니다. 끝나면 바로 보여드립니다.")
+            return
+        self.fg_path = path
+        self.fg_job = fftools.Job()
+        self.cancel_btn.config(state="normal")
+        job = self.fg_job
 
         def work():
-            try:
-                info = fftools.probe(path)
-                self.post("probed", info)
-                a = analyzer.analyze(path, info, settings, progress=lambda r, msg: self.post("prog", r, msg),
-                                     job=job, use_cache=use_cache)
-                saved = None
-                sf = segs_file(path, int(a.fps))
-                if keep_saved and os.path.isfile(sf):
-                    try:
-                        with open(sf, encoding="utf-8") as f:
-                            saved = json.load(f)
-                    except Exception:
-                        saved = None
-                segs = saved if saved else analyzer.detect(a, info["duration"], settings)
-                self.post("analyzed", info, a, segs, bool(saved))
-            except Exception as e:
-                self.post("fail", "취소됨" if job.cancelled else str(e))
+            self._analyze_work(path, job, foreground=False, use_cache=use_cache, keep_saved=keep_saved)
+            if self.fg_job is job:
+                self.fg_job = None
+                self.fg_path = None
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_probed(self, info):
+    def _probe_only(self, path):
+        try:
+            self.post("probed", path, fftools.probe(path))
+        except Exception as e:
+            self.post("afail", path, str(e))
+
+    def _on_probed(self, path, info):
         """분석 전이라도 바로 재생·탐색 가능"""
+        if path != self.path or self.info is not None:
+            return
         self.info = info
         self.view = (0.0, info["duration"])
         codec = info["vcodec"].upper() + (" 10bit" if info.get("ten_bit") else "")
         self.file_lbl.config(text=f"{os.path.basename(self.path)}   ·   {codec} {info['width']}x{info['height']}"
-                                  f"   ·   {info.get('fps', 0):.0f}fps   ·   {fftools.fmt_time(info['duration'])}")
+                                  f"   ·   {info.get('fps', 0):.0f}fps   ·   {fftools.fmt_time(info['duration'])}",
+                             foreground=TEXT)
         self.pv.itemconfig(self.pv_msg, state="hidden")
         self.draw_timeline()
         self.show_at(0.0)
 
-    def _on_analyzed(self, info, a, segs, restored):
-        self._set_busy(False)
+    def _on_analyzed(self, path, info, a, segs, restored):
+        it = self._item(path)
+        if it:
+            if it["state"] not in ("exporting", "done"):
+                it["state"] = "ready"
+            it["dur"] = info["duration"]
+        if path != self.path:
+            if it:
+                self._qrow(it)
+            return
+        if not self.exporting and not self.fg_job:
+            self.cancel_btn.config(state="disabled")
         if self.info is None:
-            self._on_probed(info)
+            self._on_probed(path, info)
         self.info, self.analysis, self.segs = info, a, segs
+        if it:
+            it["reviewed"] = True
+            self._qrow(it)
+            self._save_queue()
         self.prog.config(value=1000)
         self.refresh()
         if self.segs:
@@ -542,13 +856,13 @@ class App:
         self.status(msg)
 
     def redetect(self):
-        if not self.path or self.busy:
+        if not self.path or self.analysis is None:
             return
         if any(not s.get("auto", True) for s in self.segs) or not all(s.get("cut") for s in self.segs):
             if not messagebox.askyesno(APP_NAME, "직접 고친 내용이 사라지고 설정 기준으로 다시 찾습니다. 계속할까요?"):
                 return
-        if not self.analysis or int(self.analysis.fps) != int(self.s.get("analysis_fps", 5)):
-            self._start_analyze(self.path, use_cache=True, keep_saved=False)
+        if int(self.analysis.fps) != int(self.s.get("analysis_fps", 5)):
+            self.switch_to(self.path, use_cache=True, keep_saved=False)
             return
         self.segs = analyzer.detect(self.analysis, self.info["duration"], self.s)
         self.sel = None
@@ -871,6 +1185,13 @@ class App:
                     json.dump(self.segs, f, ensure_ascii=False)
             except Exception:
                 pass
+        self._save_settings_only()
+
+    def _save_settings_only(self):
+        try:
+            self.s["out_dir"] = self.dir_var.get().strip()
+        except Exception:
+            pass
         save_settings(self.s)
 
     # ════════════════ 타임라인 ════════════════
@@ -1113,44 +1434,72 @@ class App:
         self.drag = None
 
     # ════════════════ 저장 ════════════════
-    def pick_out(self):
-        cur = self.out_var.get()
-        p = filedialog.asksaveasfilename(title="저장 위치", defaultextension=".mp4",
-                                         initialdir=os.path.dirname(cur) if cur else None,
-                                         initialfile=os.path.basename(cur) if cur else "",
-                                         filetypes=[("MP4", "*.mp4")])
-        if p:
-            self.out_var.set(p)
+    def pick_dir(self):
+        cur = self.dir_var.get().strip()
+        d = filedialog.askdirectory(title="출력 폴더 선택", initialdir=cur or self.s.get("last_dir") or None,
+                                    mustexist=False)
+        if d:
+            self.dir_var.set(os.path.normpath(d))
+            self._save_settings_only()
+
+    def _out_path(self, src, taken):
+        d = self.dir_var.get().strip() or os.path.dirname(src)
+        stem = os.path.splitext(os.path.basename(src))[0]
+        out = os.path.join(d, stem + "_편집.mp4")
+        base, ext = os.path.splitext(out)
+        i = 2
+        while os.path.exists(out) or out in taken:
+            out = f"{base} ({i}){ext}"
+            i += 1
+        return out
 
     def _mode(self):
         v = self.mode_var.get()
         return next((k for k, t in EXPORT_MODES if t == v), "auto")
 
-    def start_export(self):
-        if not self.info or self.busy:
-            if not self.info:
-                messagebox.showinfo(APP_NAME, "먼저 영상을 열어주세요.")
+    def export_current(self):
+        if not self.path:
+            messagebox.showinfo(APP_NAME, "먼저 영상을 추가해주세요.")
             return
         if self.analysis is None:
             messagebox.showinfo(APP_NAME, "분석이 끝난 뒤 내보낼 수 있습니다.")
             return
-        out = self.out_var.get().strip()
-        if not out:
-            messagebox.showinfo(APP_NAME, "저장 위치를 정해주세요.")
+        self.start_export([self._item(self.path)])
+
+    def export_all(self):
+        todo = [it for it in self.items if it["include"] and it["state"] != "done"]
+        if not todo:
+            if any(it["include"] for it in self.items):
+                if messagebox.askyesno(APP_NAME, "체크한 영상이 모두 이미 완료 상태입니다. 다시 내보낼까요?"):
+                    todo = [it for it in self.items if it["include"]]
+            else:
+                messagebox.showinfo(APP_NAME, "영상 목록에서 내보낼 영상을 체크(출력 칸)해주세요.")
+            if not todo:
+                return
+        self.start_export(todo)
+
+    def start_export(self, todo):
+        if self.exporting or not todo:
             return
-        if os.path.abspath(out) == os.path.abspath(self.path):
-            messagebox.showerror(APP_NAME, "원본과 같은 이름으로는 저장할 수 없습니다.")
-            return
+        d = self.dir_var.get().strip()
+        if d and not os.path.isdir(d):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                messagebox.showerror(APP_NAME, "출력 폴더를 만들 수 없습니다. 다른 폴더를 골라주세요.")
+                return
         mode = self._mode()
-        real = mode if mode != "auto" else ("copy" if self.info["vcodec"] == "hevc" else "encode")
-        cuts = [s for s in self.segs if s.get("cut")]
-        keep = sum(b - a for a, b in analyzer.keep_ranges(self.segs, self.info["duration"]))
-        how = "무손실(다시 인코딩 없음)" if real == "copy" else "H.265 인코딩"
-        if os.path.exists(out) and not messagebox.askyesno(APP_NAME, "같은 이름의 파일이 있습니다. 덮어쓸까요?"):
-            return
-        if not messagebox.askyesno(APP_NAME, f"자를 구간 {len(cuts)}개를 지우고 저장합니다.\n\n"
-                                             f"저장 방식: {how}\n저장 후 길이: {fftools.fmt_time(keep)}\n"
-                                             f"저장 위치: {out}\n\n진행할까요?"):
+        unrev = [it for it in todo if not it.get("reviewed")]
+        names = "\n".join(f"  {i + 1}. {os.path.basename(it['path'])}" for i, it in enumerate(todo[:12]))
+        if len(todo) > 12:
+            names += f"\n  ... 외 {len(todo) - 12}개"
+        how = {"auto": "자동 (H.265 원본은 무손실, 그 외는 H.265 인코딩)", "copy": "무손실",
+               "encode": "H.265 인코딩"}[mode]
+        msg = (f"영상 {len(todo)}개를 순서대로 잘라서 저장합니다.\n\n{names}\n\n"
+               f"저장 방식: {how}\n출력 폴더: {d or '각 원본과 같은 폴더'}")
+        if unrev:
+            msg += f"\n\n※ 아직 열어보지 않은 영상 {len(unrev)}개는 자동으로 찾은 구간 그대로 잘립니다."
+        if not messagebox.askyesno(APP_NAME, msg + "\n\n진행할까요?"):
             return
         self.pause()
         self.s["export_mode"] = mode
@@ -1159,26 +1508,103 @@ class App:
         except Exception:
             pass
         self._save_state()
-        self._set_busy(True)
+        # 백그라운드 분석은 멈춤 (내보내기에서 필요한 것만 분석)
+        with self.aw_lock:
+            self.aw_queue.clear()
+            if self.aw_job:
+                self.aw_job.cancel()
+        for it in self.items:
+            if it["state"] in ("wait", "analyzing") and it not in todo:
+                it["state"] = "wait"
+                self._qrow(it)
+        self._set_exporting(True)
         self.prog.config(value=0)
         self.job = fftools.Job()
         job = self.job
-        path, info, segs, settings = self.path, dict(self.info), [dict(s) for s in self.segs], dict(self.s)
+        settings = dict(self.s)
+        cur_path, cur_segs = self.path, [dict(x) for x in self.segs] if self.analysis is not None else None
+        taken = set()
+        plan = []
+        for it in todo:
+            out = self._out_path(it["path"], taken)
+            taken.add(out)
+            plan.append((it["path"], out, cur_segs if it["path"] == cur_path else None))
+        threading.Thread(target=self._batch_work, args=(plan, mode, settings, job), daemon=True).start()
 
-        def work():
+    def _batch_work(self, plan, mode, settings, job):
+        n = len(plan)
+        results = []
+        for k, (path, out, segs) in enumerate(plan):
+            if job.cancelled:
+                break
+            name = os.path.basename(path)
+            head = f"[{k + 1}/{n}] {name}"
+
+            def prog(r, m, k=k, path=path, head=head, part=(0.0, 1.0)):
+                a0, a1 = part
+                rr = a0 + (a1 - a0) * r
+                self.post("item", path, {"state": "exporting", "pct": rr})
+                self.post("bprog", (k + rr) / n, f"{head} — {m}")
+
             try:
+                self.post("item", path, {"state": "exporting", "pct": 0.0})
+                info = fftools.probe(path)
+                if segs is None:
+                    a = analyzer.analyze(path, info, settings,
+                                         progress=lambda r, m: prog(r, m, part=(0.0, 0.3)), job=job)
+                    sf = segs_file(path, int(a.fps))
+                    if os.path.isfile(sf):
+                        with open(sf, encoding="utf-8") as f:
+                            segs = json.load(f)
+                    else:
+                        segs = analyzer.detect(a, info["duration"], settings)
+                        with open(sf, "w", encoding="utf-8") as f:
+                            json.dump(segs, f, ensure_ascii=False)
+                    part = (0.3, 1.0)
+                else:
+                    part = (0.0, 1.0)
                 msg = exporter.export(path, info, segs, out, mode, settings,
-                                      progress=lambda r, m: self.post("prog", r, m), job=job)
-                self.post("exported", out, msg)
+                                      progress=lambda r, m: prog(r, m, part=part), job=job)
+                self.post("item", path, {"state": "done", "pct": 1.0, "out": out})
+                results.append((path, out, True, msg.splitlines()[0]))
             except Exception as e:
-                self.post("fail", "취소됨" if job.cancelled else str(e))
+                if job.cancelled:
+                    self.post("item", path, {"state": "ready", "pct": 0.0})
+                    break
+                self.post("item", path, {"state": "error", "msg": str(e)})
+                results.append((path, out, False, str(e).splitlines()[0] if str(e) else "오류"))
+        self.post("batch_done", results, job.cancelled)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _batch_done(self, results, cancelled):
+        self._set_exporting(False)
+        self._save_queue()
+        ok = [r for r in results if r[2]]
+        bad = [r for r in results if not r[2]]
+        self.prog.config(value=1000 if ok and not cancelled else 0)
+        head = "중간에 취소했습니다." if cancelled else "모두 끝났습니다."
+        lines = [f"{head}  완료 {len(ok)}개" + (f" · 실패 {len(bad)}개" if bad else "")]
+        self.status(lines[0])
+        for p, out, good, m in results[:15]:
+            lines.append(f"{'✔' if good else '✖'} {os.path.basename(p)} — {m}")
+        # 백그라운드 분석 다시 이어감
+        for it in self.items:
+            if it["state"] == "wait":
+                self.queue_analysis(it["path"])
+        if not results:
+            return
+        if ok:
+            if messagebox.askyesno(APP_NAME, "\n".join(lines) + "\n\n저장된 폴더를 열까요?"):
+                self.reveal(ok[-1][1])
+        else:
+            messagebox.showerror(APP_NAME, "\n".join(lines))
 
     def cancel(self):
-        if self.job:
+        if self.exporting and self.job:
             self.job.cancel()
             self.status("취소하는 중...")
+        elif self.fg_job:
+            self.fg_job.cancel()
+            self.status("분석을 취소했습니다.")
 
     def reveal(self, path):
         try:
@@ -1190,15 +1616,18 @@ class App:
             pass
 
     def on_close(self):
-        if self.busy and not messagebox.askyesno(APP_NAME, "작업 중입니다. 취소하고 닫을까요?"):
+        if self.exporting and not messagebox.askyesno(APP_NAME, "내보내는 중입니다. 취소하고 닫을까요?"):
             return
-        if self.job:
-            self.job.cancel()
+        for j in (self.job, self.fg_job, self.aw_job):
+            if j:
+                j.cancel()
+        with self.aw_lock:
+            self.aw_queue.clear()
         self.player.stop()
         self.s["geometry"] = self.root.geometry()
         self._save_state()
+        self._save_queue()
         self.root.destroy()
-
 
 def dialog_base(win, app, title):
     win.title(title)
@@ -1309,7 +1738,10 @@ class UpdateDialog(tk.Toplevel):
         try:
             info = updater.latest_release()
         except Exception as e:
-            self.q.append(("err", f"새 버전을 확인하지 못했습니다. 인터넷 연결을 확인해주세요.\n({e})"))
+            if getattr(e, "code", None) == 404:
+                self.q.append(("err", "업데이트 정보를 찾을 수 없습니다. (저장소가 비공개이거나 아직 배포된 버전이 없음)"))
+            else:
+                self.q.append(("err", f"새 버전을 확인하지 못했습니다. 인터넷 연결을 확인해주세요.\n({e})"))
             return
         if not updater.is_newer(info["tag"], VERSION):
             self.q.append(("latest", f"최신 버전을 쓰고 있습니다. ({info['tag'] or VERSION})"))
@@ -1359,7 +1791,7 @@ class UpdateDialog(tk.Toplevel):
                 except Exception as e:
                     self.msg.config(text=f"설치 파일을 실행하지 못했습니다.\n{e}")
                     return
-                self.app.busy = False
+                self.app.exporting = False
                 self.app.on_close()
                 return
         if self.winfo_exists():
@@ -1374,19 +1806,20 @@ def _ui_test(app, root):
     src = sorted(glob.glob(os.path.join(tempfile.gettempdir(), "videocut_test_*", "테스트 영상.mp4")),
                  key=os.path.getmtime)[-1]
     app.sound_var.set(False)
-    app.path = src
-    info = fftools.probe(src)
-    a = analyzer.analyze(src, info, app.s)
-    print("thumbs:", a.thumbs.shape, flush=True)
-    app._on_probed(info)
-    app._on_analyzed(info, a, analyzer.detect(a, info["duration"], app.s), False)
-    root.update()
 
     def pump(sec):
         end = time.time() + sec
         while time.time() < end:
             root.update()
             time.sleep(0.01)
+
+    app.add_files([src])
+    end = time.time() + 120
+    while app.analysis is None and time.time() < end:
+        pump(0.1)
+    a = app.analysis
+    print("thumbs:", a.thumbs.shape, "queue:", len(app.items), flush=True)
+    pump(0.3)
 
     # 경계 끌기: 두 번째 구간 끝을 오른쪽으로 0.5초
     app.select(1)
@@ -1424,7 +1857,26 @@ def _ui_test(app, root):
         app._opt_changed(restart=True)
         pump(1.0)
     print("ui segs:", len(app.segs), "tree:", len(app.tree.get_children()), flush=True)
-    return drag_ok and scrub_ok and play_ok and len(app.tree.get_children()) == 4
+    tree_ok = len(app.tree.get_children()) == 4
+    # 일괄 내보내기: 두 번째 영상(H.264)을 목록에 넣고 둘 다 순서대로 저장
+    src2 = os.path.join(os.path.dirname(src), "h264.mp4")
+    app.add_files([src2], select=False)
+    outdir = tempfile.mkdtemp(prefix="videocut_batch_")
+    app.dir_var.set(outdir)
+    messagebox.askyesno = lambda *a, **k: True
+    app.reveal = lambda p: None
+    app.export_all()
+    end = time.time() + 300
+    pump(0.5)
+    while app.exporting and time.time() < end:
+        pump(0.2)
+    outs = sorted(os.listdir(outdir))
+    codecs = [fftools.probe(os.path.join(outdir, f))["vcodec"] for f in outs]
+    states = [it["state"] for it in app.items]
+    print("batch out:", outs, codecs, states, flush=True)
+    batch_ok = len(outs) == 2 and all(c == "hevc" for c in codecs) and states == ["done", "done"]
+    print(f"checks drag={drag_ok} scrub={scrub_ok} play={play_ok} tree={tree_ok} batch={batch_ok}", flush=True)
+    return drag_ok and scrub_ok and play_ok and tree_ok and batch_ok
 
 
 def main():
