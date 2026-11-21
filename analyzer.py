@@ -9,9 +9,11 @@ import numpy as np
 
 import fftools
 
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 W, H = 320, 180          # 분석용 크기
 PIX_THR = 10             # 이 이상 밝기가 바뀐 화소를 '변한 화소'로 셈
+EDGE_THR = 22            # 이웃 화소 밝기 차이가 이 이상이면 경계
+LAY_WIN = 2.0            # 화면 구성 기록 간격(초)
 
 KINDS = {
     "start": "시작 대기",
@@ -110,19 +112,25 @@ def _features(frames, prev):
     g = f.astype(np.float32)
     lap = g[:, :-2, 1:-1] + g[:, 2:, 1:-1] + g[:, 1:-1, :-2] + g[:, 1:-1, 2:] - 4 * g[:, 1:-1, 1:-1]
     sharp = lap.var(axis=(1, 2)).astype(np.float32)
-    return chg, luma, bright, sharp
+    # 화면 구성(크롭)용: 줄·칸별 움직임 비율, 가로·세로 경계선 세기
+    mv = d > PIX_THR
+    rowact = (mv.mean(axis=2) * 255).astype(np.uint8)
+    colact = (mv.mean(axis=1) * 255).astype(np.uint8)
+    rowedge = ((np.abs(f[:, 1:, :] - f[:, :-1, :]) > EDGE_THR).mean(axis=2) * 255).astype(np.uint8)
+    coledge = ((np.abs(f[:, :, 1:] - f[:, :, :-1]) > EDGE_THR).mean(axis=1) * 255).astype(np.uint8)
+    return chg, luma, bright, sharp, rowact, colact, rowedge, coledge
 
 
 class Analysis:
     """특징 기록 (프레임마다 하나씩)"""
 
-    def __init__(self, fps, chg, luma, bright, sharp, mode="", thumbs=None, tiv=2.0):
+    def __init__(self, fps, chg, luma, bright, sharp, mode="", thumbs=None, tiv=2.0, lay=None):
         self.fps = float(fps)
         self.chg, self.luma, self.bright, self.sharp = chg, luma, bright, sharp
         self.mode = mode
         self.thumbs = thumbs if thumbs is not None else np.zeros((0, TH, TW, 3), np.uint8)
         self.tiv = float(tiv)
-
+        self.lay = lay or {}         # 화면 구성 기록 (2초마다): ra, ca, re, ce
     def thumb(self, t):
         """t초에 가까운 타임라인 썸네일 (numpy HxWx3) 또는 None"""
         n = len(self.thumbs)
@@ -135,13 +143,15 @@ class Analysis:
 
     def save(self, p):
         np.savez_compressed(p, fps=self.fps, chg=self.chg, luma=self.luma, bright=self.bright, sharp=self.sharp,
-                            mode=self.mode, thumbs=self.thumbs, tiv=self.tiv)
+                            mode=self.mode, thumbs=self.thumbs, tiv=self.tiv,
+                            **{"lay_" + k: v for k, v in self.lay.items()})
 
     @staticmethod
     def load(p):
         z = np.load(p)
+        lay = {k[4:]: z[k] for k in z.files if k.startswith("lay_")}
         return Analysis(float(z["fps"]), z["chg"], z["luma"], z["bright"], z["sharp"], str(z["mode"]),
-                        z["thumbs"], float(z["tiv"]))
+                        z["thumbs"], float(z["tiv"]), lay)
 
 
 def analyze(path, info, settings, progress=None, job=None, use_cache=True):
@@ -189,7 +199,7 @@ def _run_decode(path, info, fps, mode, progress, job):
     batch = 50
     buf = bytearray(fsz * batch)
     mv = memoryview(buf)
-    parts = ([], [], [], [])
+    parts = ([], [], [], [], [], [], [], [])
     prev = None
     total = max(1, int(info["duration"] * fps))
     n = 0
@@ -222,6 +232,8 @@ def _run_decode(path, info, fps, mode, progress, job):
     if n == 0:
         return f"[{mode}] 프레임을 하나도 읽지 못함"
     cat = [np.concatenate(x) for x in parts]
+    lay = _window_layout(cat[4:], fps)
+    cat = cat[:4]
     thumbs = None
     try:
         raw = np.fromfile(thumb_file, dtype=np.uint8)
@@ -234,7 +246,24 @@ def _run_decode(path, info, fps, mode, progress, job):
             os.remove(thumb_file)
         except OSError:
             pass
-    return Analysis(fps, *cat, mode=mode, thumbs=thumbs, tiv=tiv)
+    return Analysis(fps, *cat, mode=mode, thumbs=thumbs, tiv=tiv, lay=lay)
+
+
+def _window_layout(arrs, fps):
+    """프레임별 기록 → 2초 묶음: 움직임은 최대값, 경계선은 중앙값"""
+    ra, ca, re, ce = arrs
+    win = max(1, int(round(LAY_WIN * fps)))
+    nw = len(ra) // win
+    if nw == 0:
+        return {}
+    cut = nw * win
+    out = {
+        "ra": ra[:cut].reshape(nw, win, -1).max(axis=1),
+        "ca": ca[:cut].reshape(nw, win, -1).max(axis=1),
+        "re": np.median(re[:cut].reshape(nw, win, -1), axis=1).astype(np.uint8),
+        "ce": np.median(ce[:cut].reshape(nw, win, -1), axis=1).astype(np.uint8),
+    }
+    return out
 
 
 def _mode_name(mode):
