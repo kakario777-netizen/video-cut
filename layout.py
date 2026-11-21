@@ -405,6 +405,26 @@ def make_tab_sample(path):
         raise RuntimeError(err[-300:])
 
 
+def make_portrait_sample(path):
+    """세로 녹화: 상태바, 영상, 팁 버튼 줄, 채팅(계속 바뀜, 왼쪽 아이콘 줄), 아래 내비바"""
+    graph = ("[2:v][0:v]overlay=0:48[a];[a][1:v]overlay=80:620,"
+             "drawbox=x=0:y=0:w=540:h=48:c=black:t=fill,drawbox=x=20:y=15:w=40:h=16:c=white:t=fill,"
+             "drawbox=x=440:y=15:w=80:h=16:c=white:t=fill,drawbox=x=0:y=560:w=540:h=50:c=0x111111:t=fill,"
+             "drawbox=x=200:y=568:w=60:h=30:c=0x558833:t=fill,drawbox=x=290:y=568:w=150:h=30:c=0x664400:t=fill,"
+             "drawbox=x=0:y=610:w=70:h=650:c=0x262626:t=fill,drawbox=x=20:y=640:w=24:h=24:c=0x999999:t=fill,"
+             "drawbox=x=0:y=1260:w=540:h=60:c=0xfbeef0:t=fill,drawbox=x=150:y=1280:w=16:h=20:c=0x777777:t=fill,"
+             "drawbox=x=262:y=1280:w=20:h=20:c=0x777777:t=fill[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=540x512:r=24:d=20",
+                              "-f", "lavfi", "-i", "life=s=440x620:mold=10:r=24:ratio=0.08:death_color=#202020:"
+                                                   "life_color=#bbbbbb,trim=duration=20",
+                              "-f", "lavfi", "-i", "color=c=0x1a1a1a:s=540x1320:r=24:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "28", "-g", "48", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
 def selftest(log=print):
     import tempfile
     import exporter
@@ -442,6 +462,13 @@ def selftest(log=print):
     act3 = active_segs(refine(src3, info3, detect(a3, info3)))
     log(f"tab crop: {act3}")
     ok3 = len(act3) == 1 and all(abs(u - v) <= 4 for u, v in zip(act3[0][2], [0, 58, 650, 402]))
-    ok = ok and ok2 and ok3
+    src4 = os.path.join(d, "portrait.mp4")
+    make_portrait_sample(src4)
+    info4 = fftools.probe(src4)
+    a4 = analyzer.analyze(src4, info4, analyzer.DEFAULTS, use_cache=False)
+    act4 = active_segs(refine(src4, info4, detect(a4, info4)))
+    log(f"portrait crop: {act4}")
+    ok4 = len(act4) == 1 and all(abs(u - v) <= 6 for u, v in zip(act4[0][2], [0, 48, 540, 1212]))
+    ok = ok and ok2 and ok3 and ok4
     log("crop ok" if ok else "crop FAIL")
     return ok
