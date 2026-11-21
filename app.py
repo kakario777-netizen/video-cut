@@ -2138,6 +2138,24 @@ class App:
         self._save_queue()
         self.root.destroy()
 
+def save_diagnostic(path, info, a, crop):
+    """자동 크롭 문제 확인용: 화면 그림(썸네일) 없이 줄·칸별 숫자 통계만 바탕화면에 저장"""
+    try:
+        desk = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.isdir(desk):
+            desk = os.path.dirname(path)
+        stem = os.path.splitext(os.path.basename(path))[0][:40]
+        out = os.path.join(desk, f"비디오컷_진단_{stem}.npz")
+        keep = {k: v for k, v in (info or {}).items() if k != "path"}
+        meta = json.dumps({"version": VERSION, "info": keep, "crop": crop,
+                           "lay_win": analyzer.LAY_WIN, "grid": [analyzer.W, analyzer.H]}, ensure_ascii=False)
+        np.savez_compressed(out, meta=np.array(meta), fps=a.fps, chg=a.chg, luma=a.luma,
+                            **{"lay_" + k: v for k, v in a.lay.items()})
+        return out
+    except Exception:
+        return None
+
+
 def dialog_base(win, app, title):
     win.title(title)
     win.transient(app.root)
@@ -2191,11 +2209,32 @@ class SettingsDialog(tk.Toplevel):
         ttk.Combobox(f, textvariable=self.enc, values=[n for _, n in self.enc_names], state="readonly",
                      width=18).grid(row=r, column=1, padx=8)
         r += 1
+        ttk.Label(f, text="자동 크롭 문제 알리기", style="Head.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
+                                                                    pady=(14, 0))
+        r += 1
+        df = ttk.Frame(f, style="Panel.TFrame")
+        df.grid(row=r, column=0, columnspan=2, sticky="w")
+        ttk.Button(df, text="진단 파일 저장", command=self.save_diag).pack(side="left")
+        ttk.Label(df, text="  지금 영상의 화면 구성 숫자 통계만 저장 (그림 없음)", style="Sub.TLabel").pack(side="left")
+        r += 1
         bf = ttk.Frame(f, style="Panel.TFrame")
         bf.grid(row=r, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(bf, text="기본값", command=self.reset).pack(side="left")
         ttk.Button(bf, text="저장", command=self.ok, style="Accent.TButton").pack(side="left", padx=6)
         ttk.Button(bf, text="닫기", command=self.destroy).pack(side="left")
+
+    def save_diag(self):
+        app = self.app
+        if not app.path or app.analysis is None:
+            messagebox.showinfo(APP_NAME, "먼저 크롭이 이상한 영상을 열어 분석이 끝난 뒤 눌러주세요.", parent=self)
+            return
+        out = save_diagnostic(app.path, app.info, app.analysis, app.crop)
+        if out:
+            messagebox.showinfo(APP_NAME, f"진단 파일을 저장했습니다.\n\n{out}\n\n이 파일을 채팅에 첨부해 주세요. "
+                                          "화면 그림은 들어 있지 않고 줄·칸별 숫자 통계만 있습니다.", parent=self)
+            app.reveal(out)
+        else:
+            messagebox.showerror(APP_NAME, "진단 파일을 저장하지 못했습니다.", parent=self)
 
     def reset(self):
         for key, (v, _, _) in self.vars.items():
