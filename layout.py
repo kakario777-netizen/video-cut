@@ -13,6 +13,8 @@ import fftools
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
 ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
 STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
+ROW_STILL = 0.12    # 위·아래 가로 띠(상태바·내비바)는 깜빡이는 작은 표시(녹화 중 알약 등)까지 허용
+BAR_MAX = 0.25      # 위·아래(왼·오른) 띠로 볼 최대 두께 (화면의 이 비율까지)
 FLAT = 0.80         # 바탕이 한 가지 색으로 볼 비율
 MIN_RUN = 2         # 단색 줄이 이만큼 이어져야 화면 요소로 봄
 SMOOTH = 0          # 앞뒤 몇 묶음(2초)을 합쳐 판단 (넓으면 구성이 바뀌는 곳이 묻힘)
@@ -55,10 +57,14 @@ LINE = 0.5          # 곧은 경계선으로 볼 세기 (그 줄 폭의 절반 �
 UI_FLAT = 0.4       # 메뉴바 띠의 줄들은 바탕이 이 이상 한 가지 색 (블러·영상 장면은 훨씬 낮음)
 
 
-def _bar_cut(lo, hi, flat, act, edge, n):
+def _bar_cut(lo, hi, flat, act, edge, n, still=STILL):
     """가장자리부터 곧은 선까지 통째로 '가만히 있고 블러·장면이 없는' 띠면 그 선에서 자름.
-    위(왼쪽): [0, L) 이 띠, 아래(오른쪽): [L, n) 이 띠. 못 찾으면 None"""
-    ui_row = (flat >= UI_FLAT) & (act <= STILL)
+    위(왼쪽): [0, L) 이 띠, 아래(오른쪽): [L, n) 이 띠. 못 찾으면 None
+    움직임으로 찾은 내용 범위(lo, hi)와 상관없이 가장자리 띠(BAR_MAX 이내)도 살펴봄
+    (상태바의 깜빡이는 표시 때문에 내용 범위가 0부터 잡히는 경우)"""
+    ui_row = (flat >= UI_FLAT) & (act <= still)
+    lo = max(lo, int(n * BAR_MAX))
+    hi = min(hi, n - int(n * BAR_MAX))
     top = None
     ok_prefix = np.cumsum(~ui_row)          # 0..i 까지 띠가 아닌 줄 수
     for L in range(min(lo + 1, n - 1), 0, -1):
@@ -122,7 +128,7 @@ def _window_rect(lay, w0, w1, h0=None, h1=None):
     x0 = _snap(x0, ce, GW, 0, xs[0])
     x1 = _snap(x1, ce, GW, xs[1], GW)
     # 메뉴바·탭바처럼 글자·아이콘이 많은 띠: 곧은 선까지 통째로 가만히 있고 블러가 없으면 그 선에서
-    bt, bb = _bar_cut(ys[0], ys[1], rf, rah, re, GH)
+    bt, bb = _bar_cut(ys[0], ys[1], rf, rah, re, GH, ROW_STILL)
     if bt is not None:
         y0 = max(y0, bt)
     if bb is not None:
@@ -372,6 +378,7 @@ def make_phone_sample(path):
     """폰 가로 녹화 흉내: 위 검은 상태바, 왼쪽 흰 내비바, 오른쪽 검은 여백, 오른쪽 일부 블러"""
     graph = ("[0:v]split[a][b];[b]crop=300:540:840:0,boxblur=25:2[blr];[a][blr]overlay=840:0,"
              "drawbox=x=0:y=0:w=1140:h=30:c=black:t=fill,drawbox=x=60:y=8:w=50:h=14:c=white:t=fill,"
+             "drawbox=x=130:y=6:w=90:h=18:c=0xcc2222:t=fill:enable='lt(mod(t\\,1)\\,0.5)',"
              "drawbox=x=1050:y=8:w=40:h=14:c=white:t=fill,drawbox=x=0:y=0:w=63:h=540:c=0xf0f2f5:t=fill,"
              "drawbox=x=25:y=120:w=14:h=20:c=0x777777:t=fill,drawbox=x=25:y=260:w=14:h=14:c=0x777777:t=fill,"
              "drawbox=x=1085:y=30:w=55:h=510:c=black:t=fill[v]")
@@ -393,7 +400,7 @@ def make_tab_sample(path):
              "[1:v][vid]overlay=0:58,drawbox=x=0:y=10:w=650:h=22:c=0x9c2a2e:t=fill,"
              "drawbox=x=30:y=14:w=120:h=14:c=white:t=fill,drawbox=x=450:y=15:w=14:h=12:c=white:t=fill,"
              "drawbox=x=500:y=15:w=60:h=12:c=0xeeeeee:t=fill,drawbox=x=0:y=32:w=650:h=26:c=0x333333:t=fill" + tabs +
-             ",drawbox=x=10:y=2:w=50:h=7:c=0xcc2222:t=fill,drawbox=x=580:y=2:w=50:h=7:c=white:t=fill,"
+             ",drawbox=x=10:y=2:w=50:h=7:c=0xcc2222:t=fill:enable='lt(mod(t\\,1)\\,0.5)',drawbox=x=580:y=2:w=50:h=7:c=white:t=fill,"
              "drawbox=x=10:y=470:w=30:h=30:c=0xeeeeee:t=fill,drawbox=x=50:y=475:w=50:h=20:c=0x333333:t=fill,"
              "drawbox=x=560:y=475:w=60:h=22:c=0x559933:t=fill" + icons + "[v]")
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
@@ -409,6 +416,7 @@ def make_portrait_sample(path):
     """세로 녹화: 상태바, 영상, 팁 버튼 줄, 채팅(계속 바뀜, 왼쪽 아이콘 줄), 아래 내비바"""
     graph = ("[2:v][0:v]overlay=0:48[a];[a][1:v]overlay=80:620,"
              "drawbox=x=0:y=0:w=540:h=48:c=black:t=fill,drawbox=x=20:y=15:w=40:h=16:c=white:t=fill,"
+             "drawbox=x=70:y=12:w=60:h=22:c=0xcc2222:t=fill:enable='lt(mod(t\\,1)\\,0.5)',"
              "drawbox=x=440:y=15:w=80:h=16:c=white:t=fill,drawbox=x=0:y=560:w=540:h=50:c=0x111111:t=fill,"
              "drawbox=x=200:y=568:w=60:h=30:c=0x558833:t=fill,drawbox=x=290:y=568:w=150:h=30:c=0x664400:t=fill,"
              "drawbox=x=0:y=610:w=70:h=650:c=0x262626:t=fill,drawbox=x=20:y=640:w=24:h=24:c=0x999999:t=fill,"
