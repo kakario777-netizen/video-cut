@@ -50,6 +50,40 @@ def _expand(lo, hi, flat, act, n):
     return max(0, top), min(n, bot)
 
 
+EDGE = 22           # 이웃 화소 밝기 차가 이 이상이면 경계
+LINE = 0.5          # 곧은 경계선으로 볼 세기 (그 줄 폭의 절반 이상에서 밝기가 확 바뀜)
+UI_FLAT = 0.4       # 메뉴바 띠의 줄들은 바탕이 이 이상 한 가지 색 (블러·영상 장면은 훨씬 낮음)
+
+
+def _bar_cut(lo, hi, flat, act, edge, n):
+    """가장자리부터 곧은 선까지 통째로 '가만히 있고 블러·장면이 없는' 띠면 그 선에서 자름.
+    위(왼쪽): [0, L) 이 띠, 아래(오른쪽): [L, n) 이 띠. 못 찾으면 None"""
+    ui_row = (flat >= UI_FLAT) & (act <= STILL)
+    top = None
+    ok_prefix = np.cumsum(~ui_row)          # 0..i 까지 띠가 아닌 줄 수
+    for L in range(min(lo + 1, n - 1), 0, -1):
+        if ok_prefix[L - 1] != 0:
+            continue
+        if edge[L - 1] >= LINE:
+            top = L
+            break
+        if L < n - 1 and edge[L] >= LINE:      # 경계가 L 줄 가운데를 지남 → 그 줄까지 자름
+            top = L + 1
+            break
+    bot = None
+    ok_suffix = np.cumsum((~ui_row)[::-1])[::-1]   # i..n-1 까지 띠가 아닌 줄 수
+    for L in range(max(hi - 1, 1), n):
+        if ok_suffix[L] != 0:
+            continue
+        if edge[L - 1] >= LINE:
+            bot = L
+            break
+        if L >= 2 and edge[L - 2] >= LINE:
+            bot = L - 1
+            break
+    return top, bot
+
+
 def _snap(pos, edge, n, lo_lim, hi_lim):
     """경계를 가장 강한 선(±2칸)에 맞춤. edge[i] 는 i 와 i+1 사이"""
     best, bv = pos, 0.0
@@ -87,6 +121,17 @@ def _window_rect(lay, w0, w1, h0=None, h1=None):
     y1 = _snap(y1, re, GH, ys[1], GH)
     x0 = _snap(x0, ce, GW, 0, xs[0])
     x1 = _snap(x1, ce, GW, xs[1], GW)
+    # 메뉴바·탭바처럼 글자·아이콘이 많은 띠: 곧은 선까지 통째로 가만히 있고 블러가 없으면 그 선에서
+    bt, bb = _bar_cut(ys[0], ys[1], rf, rah, re, GH)
+    if bt is not None:
+        y0 = max(y0, bt)
+    if bb is not None:
+        y1 = min(y1, bb)
+    bl, br = _bar_cut(xs[0], xs[1], cf, cah, ce, GW)
+    if bl is not None:
+        x0 = max(x0, bl)
+    if br is not None:
+        x1 = min(x1, br)
     if (x1 - x0) < GW * 0.2 or (y1 - y0) < GH * 0.2:
         return None          # 너무 작으면 믿지 않음
     return (x0, y0, x1, y1)
@@ -189,8 +234,8 @@ def _is_full(rect, W, H, tol=0.01):
 
 
 def refine(path, info, plan, job=None):
-    """분석 격자(약 6~13화소 단위)로 찾은 경계를 원본 화소로 다듬음: 구간마다 3장을 보고
-    경계 근처에서 단색 줄이 시작되는 정확한 위치를 찾음"""
+    """분석 격자(약 3~13화소 단위)로 찾은 경계를 원본 화소로 다듬음: 구간마다 3장을 보고
+    경계 근처(±3칸)에서 가장 뚜렷한 곧은 선에 맞춤. 뚜렷한 선이 없으면 그대로 둠"""
     if not plan or not plan["segs"]:
         return plan
     W, H = plan["W"], plan["H"]
@@ -211,54 +256,38 @@ def refine(path, info, plan, job=None):
             continue
         stack = np.stack(imgs)
         x, y, w, h = sg["rect"]
-        mx, my = max(4, W // GW * 3), max(4, H // GH * 3)
+        x1, y1 = x + w, y + h
+        mx, my = max(4, int(W / GW * 3)), max(4, int(H / GH * 3))
 
-        def flat_rows(r0, r1, c0, c1):
-            r0, r1 = max(0, r0), min(H, r1)
-            seg = stack[:, r0:r1, c0:c1]
-            med = np.median(seg, axis=2, keepdims=True)
-            flat = (np.abs(seg - med) <= 6).mean(axis=2).min(axis=0)     # 세 장 모두 단색이어야
-            still = (np.abs(seg - seg[:1]) <= 10).mean(axis=2).min(axis=0)
-            return r0, (flat >= FLAT) & (still >= 0.95)
+        def hline(pos, c0, c1):
+            """pos 근처에서 가장 뚜렷한 가로선 (pos = 선 아래 첫 줄)"""
+            lo, hi = max(1, pos - my), min(H - 1, pos + my)
+            if hi <= lo or c1 - c0 < 8:
+                return pos
+            d = np.abs(stack[:, lo:hi + 1, c0:c1] - stack[:, lo - 1:hi, c0:c1]) > EDGE
+            score = d.mean(axis=2).mean(axis=0)
+            k = int(np.argmax(score))
+            return lo + k if score[k] >= LINE else pos
 
-        def flat_cols(c0, c1, r0, r1):
-            c0, c1 = max(0, c0), min(W, c1)
-            seg = stack[:, r0:r1, c0:c1]
-            med = np.median(seg, axis=1, keepdims=True)
-            flat = (np.abs(seg - med) <= 6).mean(axis=1).min(axis=0)
-            still = (np.abs(seg - seg[:1]) <= 10).mean(axis=1).min(axis=0)
-            return c0, (flat >= FLAT) & (still >= 0.95)
+        def vline(pos, r0, r1):
+            lo, hi = max(1, pos - mx), min(W - 1, pos + mx)
+            if hi <= lo or r1 - r0 < 8:
+                return pos
+            d = np.abs(stack[:, r0:r1, lo:hi + 1] - stack[:, r0:r1, lo - 1:hi]) > EDGE
+            score = d.mean(axis=1).mean(axis=0)
+            k = int(np.argmax(score))
+            return lo + k if score[k] >= LINE else pos
 
-        # 위쪽: 경계 근처에서 위로 가며 마지막 '내용' 줄 바로 위까지
         if y > 0:
-            r0, m = flat_rows(y - my, y + my, x, x + w)
-            nonflat = np.where(~m)[0]
-            inside = nonflat[nonflat + r0 >= y - my]
-            if len(inside):
-                # 경계 아래쪽 범위에서 처음 내용이 시작되는 줄
-                first = r0 + int(inside[0])
-                y = max(0, min(first, y + my))
-        if y + h < H:
-            yb = y + h
-            r0, m = flat_rows(yb - my, yb + my, x, x + w)
-            nonflat = np.where(~m)[0]
-            if len(nonflat):
-                yb = min(H, r0 + int(nonflat[-1]) + 1)
-            h = yb - y
+            y = hline(y, x, x1)
+        if y1 < H:
+            y1 = hline(y1, x, x1)
         if x > 0:
-            c0, m = flat_cols(x - mx, x + mx, y, y + h)
-            nonflat = np.where(~m)[0]
-            if len(nonflat):
-                x = max(0, c0 + int(nonflat[0]))
-        if x + w < W:
-            xb = sg["rect"][0] + sg["rect"][2]
-            c0, m = flat_cols(xb - mx, xb + mx, y, y + h)
-            nonflat = np.where(~m)[0]
-            if len(nonflat):
-                xb = min(W, c0 + int(nonflat[-1]) + 1)
-            w = xb - x
+            x = vline(x, y, y1)
+        if x1 < W:
+            x1 = vline(x1, y, y1)
         x, y = x // 2 * 2, y // 2 * 2
-        w, h = max(2, min(W - x, w)) // 2 * 2, max(2, min(H - y, h)) // 2 * 2
+        w, h = max(2, min(W - x, x1 - x)) // 2 * 2, max(2, min(H - y, y1 - y)) // 2 * 2
         sg["rect"] = [x, y, w, h]
     return plan
 
@@ -354,6 +383,28 @@ def make_phone_sample(path):
         raise RuntimeError(err[-300:])
 
 
+def make_tab_sample(path):
+    """폴드·태블릿 세로형: 상태바, 빨간 메뉴바, 글자 많은 회색 탭바, 영상, 아래 버튼줄, 작업표시줄"""
+    tabs = "".join(f",drawbox=x={x}:y=40:w=40:h=10:c=0xdddddd:t=fill" for x in (40, 110, 170, 230, 300, 400, 520))
+    icons = "".join(f",drawbox=x={x}:y=515:w=22:h=22:c=0x{c}:t=fill"
+                    for x, c in zip((170, 205, 240, 275, 310, 345, 380),
+                                    ("50a030", "10a080", "70a000", "30a050", "20a070", "60a010", "40a060")))
+    graph = ("[0:v]drawbox=x=0:y=0:w=80:h=40:c=0x3399ff:t=fill,drawbox=x=580:y=5:w=60:h=36:c=0xffcc00:t=fill[vid];"
+             "[1:v][vid]overlay=0:58,drawbox=x=0:y=10:w=650:h=22:c=0x9c2a2e:t=fill,"
+             "drawbox=x=30:y=14:w=120:h=14:c=white:t=fill,drawbox=x=450:y=15:w=14:h=12:c=white:t=fill,"
+             "drawbox=x=500:y=15:w=60:h=12:c=0xeeeeee:t=fill,drawbox=x=0:y=32:w=650:h=26:c=0x333333:t=fill" + tabs +
+             ",drawbox=x=10:y=2:w=50:h=7:c=0xcc2222:t=fill,drawbox=x=580:y=2:w=50:h=7:c=white:t=fill,"
+             "drawbox=x=10:y=470:w=30:h=30:c=0xeeeeee:t=fill,drawbox=x=50:y=475:w=50:h=20:c=0x333333:t=fill,"
+             "drawbox=x=560:y=475:w=60:h=22:c=0x559933:t=fill" + icons + "[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=650x402:r=30:d=20",
+                              "-f", "lavfi", "-i", "color=c=black:s=650x540:r=30:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "28", "-g", "60", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
 def selftest(log=print):
     import tempfile
     import exporter
@@ -384,6 +435,13 @@ def selftest(log=print):
     act2 = active_segs(refine(src2, info2, detect(a2, info2)))
     log(f"phone crop: {act2}")
     ok2 = len(act2) == 1 and all(abs(u - v) <= 4 for u, v in zip(act2[0][2], [63, 30, 1022, 510]))
-    ok = ok and ok2
+    src3 = os.path.join(d, "tab.mp4")
+    make_tab_sample(src3)
+    info3 = fftools.probe(src3)
+    a3 = analyzer.analyze(src3, info3, analyzer.DEFAULTS, use_cache=False)
+    act3 = active_segs(refine(src3, info3, detect(a3, info3)))
+    log(f"tab crop: {act3}")
+    ok3 = len(act3) == 1 and all(abs(u - v) <= 4 for u, v in zip(act3[0][2], [0, 58, 650, 402]))
+    ok = ok and ok2 and ok3
     log("crop ok" if ok else "crop FAIL")
     return ok
