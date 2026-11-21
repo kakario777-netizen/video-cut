@@ -110,7 +110,7 @@ def remove_work(wd):
         pass
 
 
-def export(path, info, segs, out, mode, settings, progress=None, job=None):
+def export(path, info, segs, out, mode, settings, progress=None, job=None, crop=None):
     """mode: auto / copy / encode. 반환: 결과 메시지
     결과는 임시 이름으로 만든 뒤 끝나면 진짜 이름으로 바꿈. 인코딩 조각은 작업 폴더에 남아 있어
     중지·종료 후 다시 내보내면 이어서 진행"""
@@ -121,6 +121,10 @@ def export(path, info, segs, out, mode, settings, progress=None, job=None):
         raise RuntimeError("남길 구간이 없습니다.")
     if mode == "auto":
         mode = "copy" if info["vcodec"] == "hevc" else "encode"
+    forced = False
+    if crop and mode == "copy":
+        mode = "encode"          # 화면을 잘라야 해서 무손실로는 불가
+        forced = True
     out = os.path.abspath(out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     part = out[:-4] + ".작업중.mp4" if out.lower().endswith(".mp4") else out + ".작업중.mp4"
@@ -130,7 +134,9 @@ def export(path, info, segs, out, mode, settings, progress=None, job=None):
         if mode == "copy":
             msg = _copy(path, info, keeps, part, wd, progress, job)
         else:
-            msg = _encode(path, info, keeps, part, wd, settings, progress, job)
+            msg = _encode(path, info, keeps, part, wd, settings, progress, job, crop)
+            if forced:
+                msg += "\n(자동 크롭 구간이 있어 H.265 인코딩으로 저장)"
         if job.cancelled:
             raise RuntimeError("취소됨")
         os.replace(part, out)
@@ -180,10 +186,13 @@ def _copy(path, info, keeps, out, wd, progress, job):
     return msg
 
 
-def plan_chunks(keeps, fps, chunk_sec=None):
-    """남길 구간 → 프레임 단위 조각 [(시작 프레임, 프레임 수)], 구간 [(시작 프레임, 끝 프레임)]"""
+def plan_chunks(keeps, fps, chunk_sec=None, bounds=()):
+    """남길 구간 → 프레임 단위 조각 [(시작 프레임, 프레임 수)], 구간 [(시작 프레임, 끝 프레임)]
+    bounds: 조각을 반드시 나눌 프레임 위치(크롭이 바뀌는 곳)"""
+    import bisect
     chunk_sec = chunk_sec or CHUNK_SEC
     step = max(1, int(round(chunk_sec * fps)))
+    bounds = sorted(set(bounds))
     chunks, ranges = [], []
     for s, e in keeps:
         a, b = int(round(s * fps)), int(round(e * fps))
@@ -192,9 +201,23 @@ def plan_chunks(keeps, fps, chunk_sec=None):
         ranges.append((a, b))
         while a < b:
             n = min(step, b - a)
+            i = bisect.bisect_right(bounds, a)
+            if i < len(bounds) and bounds[i] < a + n:
+                n = bounds[i] - a
             chunks.append((a, n))
             a += n
     return chunks, ranges
+
+
+def _crop_vf(crop, t):
+    """crop = {"W","H","segs":[(start,end,rect)]} → t 시점의 필터 (없으면 None)"""
+    if not crop:
+        return None
+    import layout
+    for st, en, r in crop["segs"]:
+        if st <= t < en:
+            return layout.vf_for(r, crop["W"], crop["H"])
+    return None
 
 
 def _load_manifest(wd, sig):
@@ -237,13 +260,13 @@ def encode_progress(path, out):
         return 0.0
 
 
-def _encode(path, info, keeps, out, wd, settings, progress, job):
+def _encode(path, info, keeps, out, wd, settings, progress, job, crop=None):
     enc = pick_encoder(settings.get("encoder", "auto"))
     if not enc:
         raise RuntimeError("H.265 인코더를 찾지 못했습니다.")
     while True:
         try:
-            return _encode_with(path, info, keeps, out, wd, settings, progress, job, enc)
+            return _encode_with(path, info, keeps, out, wd, settings, progress, job, enc, crop)
         except _EncoderFailed as e:
             if enc == "libx265":
                 raise RuntimeError(str(e))
@@ -254,16 +277,21 @@ class _EncoderFailed(Exception):
     pass
 
 
-def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc):
+def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc, crop=None):
     q = int(settings.get("quality", 24))
     fps = info.get("fps") or 30.0
     fps_str = info.get("fps_str") or f"{fps:.6f}"
     gop = max(10, int(round(fps * 2)))
-    chunks, ranges = plan_chunks(keeps, fps)
+    bounds = []
+    if crop:
+        for st_, en_, _ in crop["segs"]:
+            bounds += [int(round(st_ * fps)), int(round(en_ * fps))]
+    chunks, ranges = plan_chunks(keeps, fps, bounds=bounds)
+    vfs = [_crop_vf(crop, (a + 0.5) / fps) for a, _ in chunks]
     st = os.stat(path)
     sig = {"src": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime), "enc": enc, "q": q,
            "ten": bool(info.get("ten_bit")), "fps": fps_str, "ranges": ranges, "chunks": len(chunks),
-           "chunk_sec": CHUNK_SEC, "v": 1}
+           "chunk_sec": CHUNK_SEC, "crop": crop and [list(x) for x in crop["segs"]], "v": 2}
     import json
     sig = json.loads(json.dumps(sig))       # 저장된 것과 같은 형태로 비교 (튜플→목록)
     done = _load_manifest(wd, sig)
@@ -282,6 +310,7 @@ def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc):
         ss = max(0.0, (a - 0.25) / fps)
         body = ["-ss", f"{ss:.6f}", "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
                 "-frames:v", str(n), "-fps_mode", "cfr", "-r", fps_str] + \
+            (["-vf", vfs[idx]] if vfs[idx] else []) + \
             enc_args(enc, q, info.get("ten_bit"), gop) + ["-video_track_timescale", "90000", "-f", "mp4", tmp]
         label = f"인코딩 중 ({name}) {int(done_f / max(1, total_f) * 100)}%  ·  조각 {idx + 1}/{len(chunks)}"
         cb = (lambda t, d=done_f, nn=n, lb=label: progress(min(1.0, (d + min(nn, max(0.0, t) * fps)) / total_f) * 0.95, lb)) \

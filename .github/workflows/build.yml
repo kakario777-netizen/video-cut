@@ -106,6 +106,7 @@ jobs:
           if (!(Select-String -Path $log -Pattern "ui ok" -Quiet)) { Write-Error "화면 점검 실패"; exit 1 }
           if (!(Select-String -Path $log -Pattern "dnd: True" -Quiet)) { Write-Error "끌어다 놓기 부품 누락"; exit 1 }
           if (!(Select-String -Path $log -Pattern "repair ok" -Quiet)) { Write-Error "깨진 영상 복구 점검 실패"; exit 1 }
+          if (!(Select-String -Path $log -Pattern "crop ok" -Quiet)) { Write-Error "자동 크롭 점검 실패"; exit 1 }
 
       - name: 설치 파일 만들기
         shell: pwsh

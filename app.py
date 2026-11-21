@@ -16,6 +16,7 @@ import exporter
 import fftools
 import player as playmod
 import repair
+import layout
 import updater
 from version import VERSION
 
@@ -43,7 +44,9 @@ PLAYHEAD = "#ff4d5e"
 RULER_H = 26
 LANE_Y = 34
 LANE_H = 72
-RES_Y = LANE_Y + LANE_H + 10
+CROP_Y = LANE_Y + LANE_H + 7      # 자동 크롭 구간 줄
+CROP_H = 9
+RES_Y = CROP_Y + CROP_H + 6
 RES_H = 10
 TL_H = RES_Y + RES_H + 12
 EDGE_PX = 7
@@ -197,6 +200,7 @@ class App:
         self.aw_job = None
         self.aw_current = None
         self.fg_path = None
+        self.crop = None         # 지금 영상의 자동 크롭 계획
         self.q = []
         self.view = (0.0, 1.0)
         self.t = 0.0
@@ -224,6 +228,7 @@ class App:
         root.after(16, self._display_loop)
         threading.Thread(target=self._quiet_check, daemon=True).start()
         root.after(300, self._restore_queue)
+        root.after(150, self._fit_panels)
         if not fftools.available():
             self.status("FFmpeg 를 찾지 못했습니다. 프로그램을 다시 설치해주세요.")
 
@@ -258,6 +263,7 @@ class App:
         right = ttk.Frame(mid, style="Panel.TFrame", width=410)
         mid.add(left, weight=4)
         mid.add(right, weight=1)
+        self.page_midpw = mid
 
         self.pv = tk.Canvas(left, bg="#000000", highlightthickness=0, cursor="arrow")
         self.pv.pack(fill="both", expand=True)
@@ -341,7 +347,14 @@ class App:
         btn(qb, "영상 추가", self.open_file).pack(side="left")
         btn(qb, "빼기", self.remove_item).pack(side="left", padx=4)
         btn(qb, "완료 지우기", self.clear_done).pack(side="left")
-        ttk.Label(qb, text="출력 칸 클릭 = 체크/해제", style="Sub.TLabel").pack(side="right")
+        qhint = ttk.Label(qp, text="출력 칸을 클릭하면 체크/해제", style="Sub.TLabel")
+        # 버튼·안내가 먼저 자리를 잡고 목록은 남는 공간만 (화면 배율이 커도 안 잘리게)
+        qf.pack_forget()
+        qb.pack_forget()
+        qhint.pack(side="bottom", anchor="w", pady=(3, 0))
+        qb.pack(side="bottom", fill="x", pady=(6, 0))
+        qf.pack(fill="both", expand=True, pady=(6, 0))
+        self.page_rpw = rpw
         ttk.Label(rp, text="잘라낼 구간", style="Head.TLabel").pack(anchor="w")
         self.sum_lbl = ttk.Label(rp, text="영상을 열면 자동으로 찾습니다.", style="Sub.TLabel", justify="left")
         self.sum_lbl.pack(anchor="w", pady=(2, 6))
@@ -385,8 +398,12 @@ class App:
         btn(ex, "선택", self.pick_dir).grid(row=2, column=2)
         ttk.Label(ex, text="비워두면 원본과 같은 폴더 · 파일 이름 뒤에 '_편집'", style="Sub.TLabel").grid(
             row=3, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self.crop_var = tk.BooleanVar(value=bool(self.s.get("auto_crop", True)))
+        ttk.Checkbutton(ex, text="자동 크롭 (상태바·내비바·화면 밖 요소 자르고 가운데)", variable=self.crop_var,
+                        takefocus=0, command=self._crop_opt).grid(row=4, column=0, columnspan=3, sticky="w",
+                                                                   pady=(8, 0))
         eb = ttk.Frame(ex, style="Panel.TFrame")
-        eb.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        eb.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.one_btn = btn(eb, "지금 보는 영상만 내보내기", self.export_current)
         self.one_btn.pack(side="left")
         btn(eb, "원본 폴더로", lambda: self.dir_var.set("")).pack(side="right")
@@ -456,6 +473,45 @@ class App:
                 pass
         r.bind_all("<Key>", self._on_key)
         r.bind_all("<Control-o>", lambda e: self.open_file())
+
+    def _crop_opt(self):
+        self.s["auto_crop"] = self.crop_var.get()
+        self._save_settings_only()
+        self.draw_timeline()
+        if self.last_img is not None and not self.player.playing:
+            self._render(self.last_img, self.t)
+
+    def _crop_rect(self, t):
+        return layout.rect_at(self.crop, t, self.crop_var.get()) if self.crop else None
+
+    def _load_crop(self, path, info, a):
+        """분석이 끝난 영상의 자동 크롭 계획 (처음이면 찾아서 저장)"""
+        def work():
+            try:
+                plan = layout.get(path, info, a)
+            except Exception:
+                plan = None
+            self.post("crop", path, plan)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _save_crop(self):
+        if self.path and self.analysis and self.crop:
+            layout.save(self.path, int(self.analysis.fps), self.crop)
+
+    def _fit_panels(self):
+        """켤 때 오른쪽 패널을 글자가 안 잘리는 폭·높이로 (화면 배율 반영)"""
+        try:
+            self.root.update_idletasks()
+            sc = float(self.root.tk.call("tk", "scaling")) / 1.333
+            tw = self.page_midpw.winfo_width()
+            want = int(min(tw * 0.42, max(430 * sc, tw * 0.28)))
+            if tw > 200:
+                self.page_midpw.sashpos(0, tw - want)
+            th = self.page_rpw.winfo_height()
+            if th > 200:
+                self.page_rpw.sashpos(0, int(min(th * 0.36, max(200 * sc, th * 0.26))))
+        except Exception:
+            pass
 
     # ════════════════ 깨진 영상 복구 ════════════════
     def _build_fix_page(self, r):
@@ -697,6 +753,15 @@ class App:
                 self._frow(b)
                 if m[3] == "done":
                     self.ftree.set(b["path"], "state", m[2])
+        elif kind == "crop":
+            if m[1] == self.path:
+                self.crop = m[2]
+                self.draw_timeline()
+                n = len(layout.active_segs(self.crop))
+                if n:
+                    self.status(f"자동 크롭 구간 {n}개를 찾았습니다. 타임라인 파란 줄을 클릭하면 구간별로 켜고 끕니다.")
+                if self.last_img is not None and not self.player.playing:
+                    self._render(self.last_img, self.t)
         elif kind == "fixerr":
             messagebox.showerror(APP_NAME, f"{m[1]}\n\n{m[2]}")
         elif kind == "fix_done":
@@ -942,7 +1007,7 @@ class App:
 
     def _clear_editor(self):
         self.pause()
-        self.path = self.info = self.analysis = None
+        self.path = self.info = self.analysis = self.crop = None
         self.segs, self.sel, self.t = [], None, 0.0
         self.last_img = None
         self.pv.itemconfig(self.pv_img, image="")
@@ -1017,6 +1082,7 @@ class App:
         self.path = path
         self.info = None
         self.analysis = None
+        self.crop = None
         self.segs = []
         self.sel = None
         self.t = 0.0
@@ -1090,6 +1156,8 @@ class App:
         if self.info is None:
             self._on_probed(path, info)
         self.info, self.analysis, self.segs = info, a, segs
+        self.crop = None
+        self._load_crop(path, info, a)
         if it:
             it["reviewed"] = True
             self._qrow(it)
@@ -1142,6 +1210,16 @@ class App:
 
     def _render(self, img, t):
         self.last_img = img
+        rect = self._crop_rect(t)
+        if rect and self.crop:
+            # 저장될 모습: 잘라낸 부분을 크기 그대로 가운데, 나머지 검은색
+            fx, fy = img.size[0] / self.crop["W"], img.size[1] / self.crop["H"]
+            x, y, w, h = rect
+            box = (int(x * fx), int(y * fy), int((x + w) * fx), int((y + h) * fy))
+            part = img.crop(box)
+            canvas = Image.new("RGB", img.size, (0, 0, 0))
+            canvas.paste(part, ((img.size[0] - part.size[0]) // 2, (img.size[1] - part.size[1]) // 2))
+            img = canvas
         cw, ch = max(2, self.pv.winfo_width()), max(2, self.pv.winfo_height())
         iw, ih = img.size
         sc = min(cw / iw, ch / ih)
@@ -1579,6 +1657,21 @@ class App:
                     c.create_rectangle(xe - 4, LANE_Y + LANE_H / 2 - 16, xe + 4, LANE_Y + LANE_H / 2 + 16,
                                        fill="white", outline="#222")
                     c.create_line(xe, LANE_Y + LANE_H / 2 - 8, xe, LANE_Y + LANE_H / 2 + 8, fill="#555")
+        if self.crop:
+            W0, H0 = self.crop["W"], self.crop["H"]
+            for sg in self.crop.get("segs", []):
+                if layout._is_full(sg["rect"], W0, H0) or sg["end"] < v0 or sg["start"] > v1:
+                    continue
+                xa, xb = self._x(sg["start"]), max(self._x(sg["start"]) + 2, self._x(sg["end"]))
+                on = sg.get("on", True) and self.crop_var.get()
+                if on:
+                    c.create_rectangle(xa, CROP_Y, xb, CROP_Y + CROP_H, fill="#3d8bd9", outline="")
+                else:
+                    c.create_rectangle(xa + 1, CROP_Y + 1, xb - 1, CROP_Y + CROP_H - 1, outline="#6f7680",
+                                       dash=(3, 2))
+                if xb - xa > 90:
+                    c.create_text(xa + 4, CROP_Y + CROP_H / 2, text="크롭" if on else "크롭 꺼짐", anchor="w",
+                                  fill="white", font=("맑은 고딕", 7))
         x_end = self._x(d)
         if x_end < w:
             c.create_rectangle(x_end, LANE_Y, w, RES_Y + RES_H, fill=TL_BG, outline="")
@@ -1627,6 +1720,17 @@ class App:
             return
         self.tl.focus_set()
         self.pause()
+        if CROP_Y - 2 <= e.y <= CROP_Y + CROP_H + 2 and self.crop:
+            t = self._t(e.x)
+            for sg in self.crop.get("segs", []):
+                if sg["start"] <= t < sg["end"] and not layout._is_full(sg["rect"], self.crop["W"], self.crop["H"]):
+                    sg["on"] = not sg.get("on", True)
+                    self._save_crop()
+                    self.draw_timeline()
+                    self.show_at(t)
+                    self.status(f"{fftools.fmt_time(sg['start'])}~{fftools.fmt_time(sg['end'])} 크롭을 "
+                                f"{'켰습니다' if sg['on'] else '껐습니다'}.")
+                    return
         hit = self._edge_hit(e.x, e.y)
         if hit:
             i, which, _ = hit
@@ -1836,9 +1940,15 @@ class App:
                     segs = analyzer.detect(a, info["duration"], settings)
                     with open(sf, "w", encoding="utf-8") as f:
                         json.dump(segs, f, ensure_ascii=False)
+                crop = None
+                if settings.get("auto_crop", True):
+                    plan = layout.get(path, info, a, job)
+                    act = layout.active_segs(plan)
+                    if act:
+                        crop = {"W": plan["W"], "H": plan["H"], "segs": act}
                 part = (0.0, 1.0)
                 msg = exporter.export(path, info, segs, out, mode, settings,
-                                      progress=lambda r, m: prog(r, m, part=part), job=job)
+                                      progress=lambda r, m: prog(r, m, part=part), job=job, crop=crop)
                 self.post("item", path, {"state": "done", "pct": 1.0, "out": out})
                 results.append((path, out, True, msg.splitlines()[0]))
             except Exception as e:
@@ -2235,6 +2345,7 @@ def main():
                 ok = selftest.run(lambda *a: print(*a, flush=True))
                 ui = _ui_test(app, root)
                 ui = repair.selftest(lambda *a: print(*a, flush=True)) and ui
+                ui = layout.selftest(lambda *a: print(*a, flush=True)) and ui
                 print("dnd:", bool(TkinterDnD), flush=True)
                 if ok and ui:
                     print("ui ok", flush=True)

@@ -66,7 +66,24 @@ def probe(path):
         raise RuntimeError("영상 트랙이 없는 파일입니다.")
     dur = float(d.get("format", {}).get("duration") or v.get("duration") or 0)
     pix = v.get("pix_fmt", "")
+    rot = 0
+    for sd in v.get("side_data_list", []) or []:
+        if "rotation" in sd:
+            try:
+                rot = int(float(sd["rotation"]))
+            except ValueError:
+                pass
+    if not rot:
+        try:
+            rot = int(float((v.get("tags") or {}).get("rotate", 0)))
+        except ValueError:
+            rot = 0
+    w0, h0 = int(v.get("width") or 0), int(v.get("height") or 0)
+    dw, dh = (h0, w0) if abs(rot) % 180 == 90 else (w0, h0)
     return {
+        "disp_w": dw,
+        "disp_h": dh,
+        "rotation": rot,
         "path": path,
         "duration": dur,
         "vcodec": v.get("codec_name", ""),

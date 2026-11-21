@@ -14,6 +14,8 @@ W, H = 320, 180          # 분석용 크기
 PIX_THR = 10             # 이 이상 밝기가 바뀐 화소를 '변한 화소'로 셈
 EDGE_THR = 22            # 이웃 화소 밝기 차이가 이 이상이면 경계
 LAY_WIN = 2.0            # 화면 구성 기록 간격(초)
+LAY_THR = 3              # 화면 구성용 움직임 기준(아주 약한 변화까지)
+FLAT_STEP = 5            # 단색 바탕 계산은 이 장수마다 한 번
 
 KINDS = {
     "start": "시작 대기",
@@ -113,12 +115,21 @@ def _features(frames, prev):
     lap = g[:, :-2, 1:-1] + g[:, 2:, 1:-1] + g[:, 1:-1, :-2] + g[:, 1:-1, 2:] - 4 * g[:, 1:-1, 1:-1]
     sharp = lap.var(axis=(1, 2)).astype(np.float32)
     # 화면 구성(크롭)용: 줄·칸별 움직임 비율, 가로·세로 경계선 세기
-    mv = d > PIX_THR
+    mv = d >= LAY_THR                 # 블러처럼 약한 변화도 움직임으로 (화면 요소는 아예 안 변함)
     rowact = (mv.mean(axis=2) * 255).astype(np.uint8)
     colact = (mv.mean(axis=1) * 255).astype(np.uint8)
-    rowedge = ((np.abs(f[:, 1:, :] - f[:, :-1, :]) > EDGE_THR).mean(axis=2) * 255).astype(np.uint8)
-    coledge = ((np.abs(f[:, :, 1:] - f[:, :, :-1]) > EDGE_THR).mean(axis=1) * 255).astype(np.uint8)
-    return chg, luma, bright, sharp, rowact, colact, rowedge, coledge
+    vd = np.abs(f[:, 1:, :] - f[:, :-1, :]) > EDGE_THR      # 세로 방향 밝기 차 (가로 경계선)
+    hd = np.abs(f[:, :, 1:] - f[:, :, :-1]) > EDGE_THR      # 가로 방향 밝기 차 (세로 경계선)
+    rowedge = (vd.mean(axis=2) * 255).astype(np.uint8)     # 줄 사이 가로선 세기
+    coledge = (hd.mean(axis=1) * 255).astype(np.uint8)     # 칸 사이 세로선 세기
+    # 바탕이 한 가지 색인 정도 (상태바·텍스트바 = 높음, 블러 = 낮음, 글자가 있어도 바탕 기준)
+    # 계산이 무거워 1초에 한 장 정도만 (5장마다)
+    sub = frames[::FLAT_STEP].astype(np.int16)
+    rmed = np.median(sub, axis=2, keepdims=True)
+    cmed = np.median(sub, axis=1, keepdims=True)
+    rowflat = ((np.abs(sub - rmed) <= 3).mean(axis=2) * 255).astype(np.uint8)
+    colflat = ((np.abs(sub - cmed) <= 3).mean(axis=1) * 255).astype(np.uint8)
+    return chg, luma, bright, sharp, rowact, colact, rowedge, coledge, rowflat, colflat
 
 
 class Analysis:
@@ -199,7 +210,7 @@ def _run_decode(path, info, fps, mode, progress, job):
     batch = 50
     buf = bytearray(fsz * batch)
     mv = memoryview(buf)
-    parts = ([], [], [], [], [], [], [], [])
+    parts = tuple([] for _ in range(10))
     prev = None
     total = max(1, int(info["duration"] * fps))
     n = 0
@@ -251,18 +262,28 @@ def _run_decode(path, info, fps, mode, progress, job):
 
 def _window_layout(arrs, fps):
     """프레임별 기록 → 2초 묶음: 움직임은 최대값, 경계선은 중앙값"""
-    ra, ca, re, ce = arrs
+    names = ("ra", "ca", "re", "ce", "rf", "cf")
     win = max(1, int(round(LAY_WIN * fps)))
-    nw = len(ra) // win
+    nw = len(arrs[0]) // win
     if nw == 0:
         return {}
-    cut = nw * win
-    out = {
-        "ra": ra[:cut].reshape(nw, win, -1).max(axis=1),
-        "ca": ca[:cut].reshape(nw, win, -1).max(axis=1),
-        "re": np.median(re[:cut].reshape(nw, win, -1), axis=1).astype(np.uint8),
-        "ce": np.median(ce[:cut].reshape(nw, win, -1), axis=1).astype(np.uint8),
-    }
+    out = {}
+    for k, a in zip(names, arrs):
+        if k in ("rf", "cf"):
+            # 5장마다 한 장씩만 계산한 값 → 묶음마다 해당 칸 모아서 중앙값
+            idx = np.arange(len(a)) * FLAT_STEP
+            wi = np.minimum(idx // win, nw - 1)
+            o = np.zeros((nw, a.shape[1]), np.uint8)
+            for w in range(nw):
+                sel = a[wi == w]
+                if len(sel):
+                    o[w] = np.median(sel, axis=0)
+                elif w:
+                    o[w] = o[w - 1]
+            out[k] = o
+            continue
+        b = a[:nw * win].reshape(nw, win, -1)
+        out[k] = b.max(axis=1) if k in ("ra", "ca") else np.median(b, axis=1).astype(np.uint8)
     return out
 
 
