@@ -73,6 +73,7 @@ def probe(path):
         "width": int(v.get("width") or 0),
         "height": int(v.get("height") or 0),
         "fps": _ratio(v.get("avg_frame_rate", "0/1")) or _ratio(v.get("r_frame_rate", "0/1")),
+        "fps_str": v.get("avg_frame_rate") if _ratio(v.get("avg_frame_rate", "0/1")) else v.get("r_frame_rate", "30/1"),
         "pix_fmt": pix,
         "ten_bit": "10" in pix or "12" in pix,
         "has_audio": a is not None,
@@ -138,22 +139,57 @@ class Job:
     def __init__(self):
         self.proc = None
         self.cancelled = False
+        self.paused = False
 
     def cancel(self):
         self.cancelled = True
+        if self.paused:
+            self.resume()
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.kill()
             except Exception:
                 pass
 
+    def _signal(self, stop):
+        p = self.proc
+        if not p or p.poll() is not None:
+            return
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                fn = ctypes.windll.ntdll.NtSuspendProcess if stop else ctypes.windll.ntdll.NtResumeProcess
+                fn(int(p._handle))
+            else:
+                import signal
+                os.kill(p.pid, signal.SIGSTOP if stop else signal.SIGCONT)
+        except Exception:
+            pass
+
+    def pause(self):
+        """실행 중인 ffmpeg 를 그 자리에서 얼림 (손실 없음)"""
+        self.paused = True
+        self._signal(True)
+
+    def resume(self):
+        self.paused = False
+        self._signal(False)
+
+    def wait_if_paused(self):
+        import time
+        while self.paused and not self.cancelled:
+            time.sleep(0.2)
+
     def run(self, args, on_time=None):
         """args 는 ffmpeg 뒤의 인자. 반환: (returncode, stderr 끝부분)"""
+        self.wait_if_paused()
         if self.cancelled:
             return -1, "취소됨"
         full = [FFMPEG, "-hide_banner", "-nostdin", "-progress", "pipe:1", "-nostats"] + args
         self.proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                      creationflags=NOWIN)
+        if self.paused:
+            self._signal(True)
         tail = []
 
         def read_err():
