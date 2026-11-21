@@ -11,6 +11,7 @@ import analyzer
 import fftools
 
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
+LAYOUT_VERSION = 3                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
 ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
 STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
 ROW_STILL = 0.12    # 위·아래 가로 띠(상태바·내비바)는 깜빡이는 작은 표시(녹화 중 알약 등)까지 허용
@@ -322,13 +323,17 @@ def get(path, info, a, job=None):
     """저장된 계획이 있으면 그것, 없으면 찾아서 저장"""
     p = load(path, int(a.fps))
     if p is not None:
-        return p
+        manual = any(sg.get("manual") for sg in p.get("segs", []))
+        if manual or p.get("lv") == LAYOUT_VERSION:
+            return p                 # 직접 지정한 크롭은 그대로
     p = detect(a, info)
     if p and p["segs"]:
         p = refine(path, info, p, job)
     if job is not None and job.cancelled:
         return p
-    save(path, int(a.fps), p or {"W": info.get("disp_w"), "H": info.get("disp_h"), "segs": []})
+    p = p or {"W": info.get("disp_w"), "H": info.get("disp_h"), "segs": []}
+    p["lv"] = LAYOUT_VERSION
+    save(path, int(a.fps), p)
     return p
 
 
