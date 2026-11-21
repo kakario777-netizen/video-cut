@@ -274,7 +274,14 @@ class App:
         self.pv_badge = self.pv.create_text(0, 0, text="", fill="white", font=FONT_B, anchor="nw", state="hidden")
         self.pv_frame = self.pv.create_rectangle(0, 0, 0, 0, outline="#c62838", width=3, state="hidden")
         self.pv.bind("<Configure>", lambda e: self._layout_preview())
-        self.pv.bind("<Button-1>", lambda e: self.toggle_play())
+        self.pv.bind("<ButtonPress-1>", self._pv_press)
+        self.pv.bind("<B1-Motion>", self._pv_motion)
+        self.pv.bind("<ButtonRelease-1>", self._pv_release)
+        self.pv_sel = self.pv.create_rectangle(0, 0, 0, 0, outline="#3d8bd9", width=2, dash=(6, 3), state="hidden")
+        self.pv_hint = self.pv.create_text(0, 0, text="", fill="white", font=FONT_B, anchor="n", state="hidden")
+        self.crop_draw = False
+        self.pv_geom = None
+        self.draw_start = None
 
         tr = ttk.Frame(left, style="Panel.TFrame", padding=(10, 6))
         tr.pack(fill="x")
@@ -430,6 +437,10 @@ class App:
         btn(tb, "시작을 여기로 (I)", lambda: self.set_edge_here("start")).pack(side="left", padx=2)
         btn(tb, "끝을 여기로 (O)", lambda: self.set_edge_here("end")).pack(side="left", padx=2)
         btn(tb, "여기에 구간 추가 (A)", self.add_here).pack(side="left", padx=2)
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
+        self.crop_btn = btn(tb, "크롭 직접 지정", self.toggle_crop_draw)
+        self.crop_btn.pack(side="left")
+        btn(tb, "크롭 모두 끄기", self.crop_all_off).pack(side="left", padx=2)
         lg = ttk.Frame(tb, style="Panel.TFrame")
         lg.pack(side="right")
         for k in ("start", "freeze", "wait", "blur", "black", "end", "manual"):
@@ -1211,7 +1222,7 @@ class App:
     def _render(self, img, t):
         self.last_img = img
         rect = self._crop_rect(t)
-        if rect and self.crop:
+        if rect and self.crop and not self.crop_draw:
             # 저장될 모습: 잘라낸 부분을 크기 그대로 가운데, 나머지 검은색
             fx, fy = img.size[0] / self.crop["W"], img.size[1] / self.crop["H"]
             x, y, w, h = rect
@@ -1234,6 +1245,23 @@ class App:
             self.photo = ImageTk.PhotoImage(im)
             self.pv.itemconfig(self.pv_img, image=self.photo)
         x0, y0 = (cw - dw) / 2, (ch - dh) / 2
+        self.pv_geom = (x0, y0, dw, dh)
+        if self.crop_draw:
+            seg = None
+            self.pv.coords(self.pv_hint, cw / 2, 10)
+            self.pv.itemconfig(self.pv_hint, state="normal",
+                               text="남길 영역을 마우스로 그리세요  (다시 누르면 취소: '크롭 직접 지정')")
+            if rect and self.draw_start is None:
+                W0, H0 = self._crop_wh()
+                x, y, w, h = rect
+                self.pv.coords(self.pv_sel, x0 + x / W0 * dw, y0 + y / H0 * dh,
+                               x0 + (x + w) / W0 * dw, y0 + (y + h) / H0 * dh)
+                self.pv.itemconfig(self.pv_sel, state="normal")
+            self.pv.tag_raise(self.pv_sel)
+            self.pv.tag_raise(self.pv_hint)
+        else:
+            self.pv.itemconfig(self.pv_hint, state="hidden")
+            self.pv.itemconfig(self.pv_sel, state="hidden")
         st = "normal" if seg is not None else "hidden"
         if seg is not None:
             txt = f"  ✂ 잘릴 구간 · {analyzer.KINDS.get(seg['kind'], seg['kind'])}  "
@@ -1247,6 +1275,96 @@ class App:
             self.pv.itemconfig(it, state=st)
         self.pv.tag_raise(self.pv_badge_bg)
         self.pv.tag_raise(self.pv_badge)
+
+    # ════════════════ 크롭 직접 지정 ════════════════
+    def _crop_wh(self):
+        if self.crop:
+            return self.crop["W"], self.crop["H"]
+        return self.info.get("disp_w") or self.info["width"], self.info.get("disp_h") or self.info["height"]
+
+    def toggle_crop_draw(self):
+        if not self.info or self.analysis is None:
+            messagebox.showinfo(APP_NAME, "영상 분석이 끝난 뒤 지정할 수 있습니다.")
+            return
+        self.pause()
+        self.crop_draw = not self.crop_draw
+        self.draw_start = None
+        self.crop_btn.config(text="크롭 지정 취소" if self.crop_draw else "크롭 직접 지정")
+        if self.crop_draw:
+            self.status("프리뷰 화면에서 남길 영역(영상+블러)을 마우스로 끌어 그리세요. 그 밖은 검은색이 됩니다.")
+        self.show_at(self.t)
+
+    def _pv_press(self, e):
+        if not self.crop_draw:
+            self.toggle_play()
+            return
+        self.draw_start = (e.x, e.y)
+        self.pv.coords(self.pv_sel, e.x, e.y, e.x, e.y)
+        self.pv.itemconfig(self.pv_sel, state="normal")
+
+    def _pv_motion(self, e):
+        if self.crop_draw and self.draw_start and self.pv_geom:
+            x0, y0, dw, dh = self.pv_geom
+            ex = min(max(e.x, x0), x0 + dw)
+            ey = min(max(e.y, y0), y0 + dh)
+            self.pv.coords(self.pv_sel, self.draw_start[0], self.draw_start[1], ex, ey)
+
+    def _pv_release(self, e):
+        if not (self.crop_draw and self.draw_start and self.pv_geom):
+            return
+        x0, y0, dw, dh = self.pv_geom
+        ax, ay, bx, by = self.pv.coords(self.pv_sel)
+        self.draw_start = None
+        W0, H0 = self._crop_wh()
+        sx0 = (min(ax, bx) - x0) / dw * W0
+        sx1 = (max(ax, bx) - x0) / dw * W0
+        sy0 = (min(ay, by) - y0) / dh * H0
+        sy1 = (max(ay, by) - y0) / dh * H0
+        sx0, sy0 = max(0, int(sx0)) // 2 * 2, max(0, int(sy0)) // 2 * 2
+        sx1, sy1 = min(W0, int(round(sx1))), min(H0, int(round(sy1)))
+        w, h = (sx1 - sx0) // 2 * 2, (sy1 - sy0) // 2 * 2
+        if w < 32 or h < 32:
+            self.status("영역이 너무 작습니다. 다시 그려주세요.")
+            return
+        rect = [sx0, sy0, w, h]
+        if self.crop is None:
+            self.crop = {"W": W0, "H": H0, "segs": []}
+        dur = self._dur()
+        cur = next((sg for sg in self.crop["segs"] if sg["start"] <= self.t < sg["end"]
+                    and not layout._is_full(sg["rect"], W0, H0)), None)
+        whole = True
+        if cur is not None and len(self.crop["segs"]) > 1:
+            ans = messagebox.askyesnocancel(
+                APP_NAME, f"이 영역을 어디에 적용할까요?\n\n예: 영상 전체\n아니요: 지금 크롭 구간만 "
+                          f"({fftools.fmt_time(cur['start'])} ~ {fftools.fmt_time(cur['end'])})")
+            if ans is None:
+                self.show_at(self.t)
+                return
+            whole = ans
+        if whole:
+            self.crop["segs"] = [{"start": 0.0, "end": dur, "rect": rect, "on": True, "manual": True}]
+        else:
+            cur.update({"rect": rect, "on": True, "manual": True})
+        self.crop_var.set(True)
+        self.s["auto_crop"] = True
+        self._save_crop()
+        self.crop_draw = False
+        self.crop_btn.config(text="크롭 직접 지정")
+        self.draw_timeline()
+        self.show_at(self.t)
+        self.status(f"크롭 영역을 {'영상 전체' if whole else '이 구간'}에 지정했습니다 ({w}x{h}). "
+                    "프리뷰가 저장될 모습입니다.")
+
+    def crop_all_off(self):
+        if not self.crop or not self.crop.get("segs"):
+            self.status("켜진 크롭이 없습니다.")
+            return
+        for sg in self.crop["segs"]:
+            sg["on"] = False
+        self._save_crop()
+        self.draw_timeline()
+        self.show_at(self.t)
+        self.status("이 영상의 크롭을 모두 껐습니다. (타임라인 크롭 줄을 클릭하면 구간별로 다시 켤 수 있어요)")
 
     def _display_loop(self):
         try:
@@ -2307,14 +2425,40 @@ def _ui_test(app, root):
     resume_ok = it0["state"] == "done" and len([f for f in outs2 if f.endswith("_편집.mp4")]) == 1 and \
         not os.path.exists(os.path.join(outdir2, ".videocut_work"))
     exporter.CHUNK_SEC = 120
+    # 크롭 직접 지정: 프리뷰에서 가운데 절반 영역을 그림
+    app.switch_to(app.items[0]["path"])
+    end = time.time() + 60
+    while app.analysis is None and time.time() < end:
+        pump(0.1)
+    app.show_at(5.0)
+    pump(1.5)
+    app.toggle_crop_draw()
+    pump(1.0)
+    gx, gy, gw, gh = app.pv_geom
+    ev = type("E", (), {})()
+    ev.x, ev.y = gx + gw * 0.25, gy + gh * 0.25
+    app._pv_press(ev)
+    ev.x, ev.y = gx + gw * 0.75, gy + gh * 0.75
+    app._pv_motion(ev)
+    app._pv_release(ev)
+    pump(1.0)
+    cs = app.crop and app.crop.get("segs")
+    print("manual crop:", cs, flush=True)
+    W0 = app.crop["W"] if app.crop else 0
+    manual_ok = bool(cs) and len(cs) == 1 and abs(cs[0]["rect"][0] - W0 * 0.25) <= W0 * 0.02 and \
+        abs(cs[0]["rect"][2] - W0 * 0.5) <= W0 * 0.03 and layout.rect_at(app.crop, 5.0) is not None
+    reload = layout.load(app.path, int(app.analysis.fps))
+    manual_ok = manual_ok and reload and reload["segs"][0].get("manual")
+    app.crop_all_off()
+    manual_ok = manual_ok and layout.rect_at(app.crop, 5.0) is None
     # 복구 화면 전환
     app.show_page("fix")
     pump(0.3)
     app.show_page("edit")
     pump(0.3)
     print(f"checks drag={drag_ok} scrub={scrub_ok} play={play_ok} tree={tree_ok} batch={batch_ok} "
-          f"pause={paused_ok} stop={stop_ok} btn={btn_ok} resume={resume_ok}", flush=True)
-    return all((drag_ok, scrub_ok, play_ok, tree_ok, batch_ok, paused_ok, stop_ok, btn_ok, resume_ok))
+          f"pause={paused_ok} stop={stop_ok} btn={btn_ok} resume={resume_ok} manual_crop={manual_ok}", flush=True)
+    return all((drag_ok, scrub_ok, play_ok, tree_ok, batch_ok, paused_ok, stop_ok, btn_ok, resume_ok, manual_ok))
 
 
 def main():

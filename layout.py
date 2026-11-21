@@ -11,7 +11,8 @@ import analyzer
 import fftools
 
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
-ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율
+ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
+STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
 FLAT = 0.80         # 바탕이 한 가지 색으로 볼 비율
 MIN_RUN = 2         # 단색 줄이 이만큼 이어져야 화면 요소로 봄
 SMOOTH = 0          # 앞뒤 몇 묶음(2초)을 합쳐 판단 (넓으면 구성이 바뀌는 곳이 묻힘)
@@ -34,7 +35,7 @@ def _expand(lo, hi, flat, act, n):
         run = 0
         cut = stop
         while i != stop:
-            ui = flat[i] >= FLAT and act[i] <= ACT
+            ui = flat[i] >= FLAT and act[i] <= STILL
             if ui:
                 run += 1
                 if run >= need or (i + step == stop and run >= MIN_RUN):
@@ -65,10 +66,14 @@ def _window_rect(lay, w0, w1, h0=None, h1=None):
     """w0~w1 묶음의 영역. 움직임 여부는 h0~h1(더 넓은 범위)까지 봄 — 잠깐 멈춘 채팅 등을 지키려고"""
     h0 = w0 if h0 is None else h0
     h1 = w1 if h1 is None else h1
-    ra = lay["ra"][w0:w1].max(axis=0) / 255.0
-    ca = lay["ca"][w0:w1].max(axis=0) / 255.0
-    rah = lay["ra"][h0:h1].max(axis=0) / 255.0
-    cah = lay["ca"][h0:h1].max(axis=0) / 255.0
+    def agg(arr, a0, a1):
+        x = arr[a0:a1]
+        # 여러 묶음이면 가끔 튀는 잡음을 빼고 (90% 지점), 하나면 그대로
+        return (np.percentile(x, 90, axis=0) if len(x) > 3 else x.max(axis=0)) / 255.0
+    ra = agg(lay["ra"], w0, w1)
+    ca = agg(lay["ca"], w0, w1)
+    rah = agg(lay["ra"], h0, h1)
+    cah = agg(lay["ca"], h0, h1)
     rf = np.median(lay["rf"][w0:w1], axis=0) / 255.0
     cf = np.median(lay["cf"][w0:w1], axis=0) / 255.0
     re = np.median(lay["re"][w0:w1], axis=0) / 255.0
@@ -212,17 +217,17 @@ def refine(path, info, plan, job=None):
             r0, r1 = max(0, r0), min(H, r1)
             seg = stack[:, r0:r1, c0:c1]
             med = np.median(seg, axis=2, keepdims=True)
-            flat = (np.abs(seg - med) <= 3).mean(axis=2).min(axis=0)     # 세 장 모두 단색이어야
-            still = (np.abs(seg - seg[:1]) <= 2).mean(axis=2).min(axis=0)
-            return r0, (flat >= FLAT) & (still >= 0.97)
+            flat = (np.abs(seg - med) <= 6).mean(axis=2).min(axis=0)     # 세 장 모두 단색이어야
+            still = (np.abs(seg - seg[:1]) <= 10).mean(axis=2).min(axis=0)
+            return r0, (flat >= FLAT) & (still >= 0.95)
 
         def flat_cols(c0, c1, r0, r1):
             c0, c1 = max(0, c0), min(W, c1)
             seg = stack[:, r0:r1, c0:c1]
             med = np.median(seg, axis=1, keepdims=True)
-            flat = (np.abs(seg - med) <= 3).mean(axis=1).min(axis=0)
-            still = (np.abs(seg - seg[:1]) <= 2).mean(axis=1).min(axis=0)
-            return c0, (flat >= FLAT) & (still >= 0.97)
+            flat = (np.abs(seg - med) <= 6).mean(axis=1).min(axis=0)
+            still = (np.abs(seg - seg[:1]) <= 10).mean(axis=1).min(axis=0)
+            return c0, (flat >= FLAT) & (still >= 0.95)
 
         # 위쪽: 경계 근처에서 위로 가며 마지막 '내용' 줄 바로 위까지
         if y > 0:
@@ -334,6 +339,21 @@ def make_sample(path):
         raise RuntimeError(err[-300:])
 
 
+def make_phone_sample(path):
+    """폰 가로 녹화 흉내: 위 검은 상태바, 왼쪽 흰 내비바, 오른쪽 검은 여백, 오른쪽 일부 블러"""
+    graph = ("[0:v]split[a][b];[b]crop=300:540:840:0,boxblur=25:2[blr];[a][blr]overlay=840:0,"
+             "drawbox=x=0:y=0:w=1140:h=30:c=black:t=fill,drawbox=x=60:y=8:w=50:h=14:c=white:t=fill,"
+             "drawbox=x=1050:y=8:w=40:h=14:c=white:t=fill,drawbox=x=0:y=0:w=63:h=540:c=0xf0f2f5:t=fill,"
+             "drawbox=x=25:y=120:w=14:h=20:c=0x777777:t=fill,drawbox=x=25:y=260:w=14:h=14:c=0x777777:t=fill,"
+             "drawbox=x=1085:y=30:w=55:h=510:c=black:t=fill[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=1140x540:r=30:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "30", "-g", "60", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
 def selftest(log=print):
     import tempfile
     import exporter
@@ -356,5 +376,14 @@ def selftest(log=print):
     center = g is not None and g[150:210, 280:360].mean() > 40
     log(f"crop out: {o['width']}x{o['height']} {o['vcodec']} black_edge={black_edge} center={center}")
     ok = ok and o["width"] == 640 and o["height"] == 360 and black_edge and center
+    # 폰 가로 녹화 (녹화 잡음이 있는 상태바·내비바)
+    src2 = os.path.join(d, "phone.mp4")
+    make_phone_sample(src2)
+    info2 = fftools.probe(src2)
+    a2 = analyzer.analyze(src2, info2, analyzer.DEFAULTS, use_cache=False)
+    act2 = active_segs(refine(src2, info2, detect(a2, info2)))
+    log(f"phone crop: {act2}")
+    ok2 = len(act2) == 1 and all(abs(u - v) <= 4 for u, v in zip(act2[0][2], [63, 30, 1022, 510]))
+    ok = ok and ok2
     log("crop ok" if ok else "crop FAIL")
     return ok

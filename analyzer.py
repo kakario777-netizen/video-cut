@@ -9,12 +9,12 @@ import numpy as np
 
 import fftools
 
-FEATURE_VERSION = 4
+FEATURE_VERSION = 5
 W, H = 320, 180          # 분석용 크기
 PIX_THR = 10             # 이 이상 밝기가 바뀐 화소를 '변한 화소'로 셈
 EDGE_THR = 22            # 이웃 화소 밝기 차이가 이 이상이면 경계
 LAY_WIN = 2.0            # 화면 구성 기록 간격(초)
-LAY_THR = 3              # 화면 구성용 움직임 기준(아주 약한 변화까지)
+LAY_THR = 12             # 화면 구성용 움직임 기준 (녹화 파일의 미세한 깜빡임은 무시, 블러는 '단색 아님'으로 지킴)
 FLAT_STEP = 5            # 단색 바탕 계산은 이 장수마다 한 번
 
 KINDS = {
@@ -115,7 +115,7 @@ def _features(frames, prev):
     lap = g[:, :-2, 1:-1] + g[:, 2:, 1:-1] + g[:, 1:-1, :-2] + g[:, 1:-1, 2:] - 4 * g[:, 1:-1, 1:-1]
     sharp = lap.var(axis=(1, 2)).astype(np.float32)
     # 화면 구성(크롭)용: 줄·칸별 움직임 비율, 가로·세로 경계선 세기
-    mv = d >= LAY_THR                 # 블러처럼 약한 변화도 움직임으로 (화면 요소는 아예 안 변함)
+    mv = d >= LAY_THR
     rowact = (mv.mean(axis=2) * 255).astype(np.uint8)
     colact = (mv.mean(axis=1) * 255).astype(np.uint8)
     vd = np.abs(f[:, 1:, :] - f[:, :-1, :]) > EDGE_THR      # 세로 방향 밝기 차 (가로 경계선)
