@@ -5,3 +5,6 @@ dist/
 installer_out/
 *.zip
 ffmpeg/
+untrunc/
+utx/
+ut.zip

@@ -48,6 +48,18 @@ jobs:
           .\ffmpeg\ffmpeg.exe -hide_banner -version | Select-Object -First 1
           .\ffmpeg\ffmpeg.exe -hide_banner -encoders | Select-String "hevc"
 
+      - name: untrunc 내려받기 (깨진 영상 복구)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/anthwlock/untrunc/releases/download/latest/untrunc_x64.zip" -OutFile ut.zip
+          Expand-Archive ut.zip -DestinationPath utx
+          $exe = Get-ChildItem utx -Recurse -Filter untrunc.exe | Select-Object -First 1
+          if (!$exe) { Get-ChildItem utx -Recurse | Select-Object FullName; Write-Error "untrunc.exe 없음"; exit 1 }
+          New-Item -ItemType Directory -Force untrunc | Out-Null
+          Copy-Item (Join-Path $exe.DirectoryName "*") untrunc\ -Recurse -Force
+          Get-ChildItem untrunc | Select-Object Name, Length | Format-Table
+          exit 0
+
       - name: 라이브러리 설치
         run: pip install -r requirements.txt nuitka ordered-set zstandard
 
@@ -80,6 +92,7 @@ jobs:
           $dnd = python -c "import tkinterdnd2, os; print(os.path.join(os.path.dirname(tkinterdnd2.__file__), 'tkdnd'))"
           Copy-Item -Recurse -Force $dnd dist\VideoCut\tkinterdnd2\tkdnd
           Copy-Item -Recurse -Force ffmpeg dist\VideoCut\ffmpeg
+          Copy-Item -Recurse -Force untrunc dist\VideoCut\untrunc
           Get-ChildItem dist\VideoCut | Select-Object -First 15 | Format-Table Name, Length
 
       - name: 동작 확인 (완성된 프로그램)
@@ -92,6 +105,7 @@ jobs:
           if (!(Select-String -Path $log -Pattern "selftest ok" -Quiet)) { Write-Error "완성된 프로그램 점검 실패"; exit 1 }
           if (!(Select-String -Path $log -Pattern "ui ok" -Quiet)) { Write-Error "화면 점검 실패"; exit 1 }
           if (!(Select-String -Path $log -Pattern "dnd: True" -Quiet)) { Write-Error "끌어다 놓기 부품 누락"; exit 1 }
+          if (!(Select-String -Path $log -Pattern "repair ok" -Quiet)) { Write-Error "깨진 영상 복구 점검 실패"; exit 1 }
 
       - name: 설치 파일 만들기
         shell: pwsh
@@ -108,6 +122,7 @@ jobs:
           $exe = "$env:ProgramFiles\VideoCut\VideoCut.exe"
           if (!(Test-Path $exe)) { Write-Error "설치 실패"; exit 1 }
           if (!(Test-Path "$env:ProgramFiles\VideoCut\ffmpeg\ffmpeg.exe")) { Write-Error "FFmpeg 누락"; exit 1 }
+          if (!(Test-Path "$env:ProgramFiles\VideoCut\untrunc\untrunc.exe")) { Write-Error "복구 도구 누락"; exit 1 }
           if (!(Test-Path "$env:PUBLIC\Desktop\비디오 컷.lnk")) { Write-Error "바로가기 없음"; exit 1 }
           (Get-Item "installer_out\VideoCut_Setup.exe").Length / 1MB
 

@@ -15,6 +15,7 @@ import analyzer
 import exporter
 import fftools
 import player as playmod
+import repair
 import updater
 from version import VERSION
 
@@ -136,6 +137,12 @@ def apply_theme(root):
     st.configure("Accent.TButton", background=ACCENT, foreground="#08201b", font=FONT_B, padding=(18, 6),
                  bordercolor=ACCENT)
     st.map("Accent.TButton", background=[("disabled", "#2d5a52"), ("pressed", ACCENT_D), ("active", "#3fd8bc")])
+    st.configure("Tab.TButton", background=PANEL, foreground=SUB, padding=(14, 6), bordercolor=PANEL,
+                 font=FONT_B)
+    st.map("Tab.TButton", background=[("active", PANEL2)])
+    st.configure("TabOn.TButton", background=BG, foreground=ACCENT, padding=(14, 6), bordercolor=ACCENT,
+                 font=FONT_B)
+    st.map("TabOn.TButton", background=[("active", BG)])
     st.configure("Play.TButton", background=PANEL2, font=("맑은 고딕", 11, "bold"), padding=(14, 4))
     st.configure("TCheckbutton", background=PANEL, foreground=TEXT, indicatorbackground=PANEL2,
                  indicatorforeground=ACCENT, focusthickness=0)
@@ -229,6 +236,10 @@ class App:
         # 위 막대
         top = ttk.Frame(r, style="Panel.TFrame", padding=(10, 7))
         top.grid(row=0, column=0, sticky="ew")
+        self.tab_edit = btn(top, "자르기·인코딩", lambda: self.show_page("edit"), "TabOn.TButton")
+        self.tab_edit.pack(side="left")
+        self.tab_fix = btn(top, "깨진 영상 복구", lambda: self.show_page("fix"), "Tab.TButton")
+        self.tab_fix.pack(side="left", padx=(2, 14))
         btn(top, "영상 추가", self.open_file, "TButton").pack(side="left")
         self.file_lbl = ttk.Label(top, text="영상 파일을 추가하거나 이 창에 끌어다 놓으세요. (여러 개 가능)", style="Sub.TLabel")
         self.file_lbl.pack(side="left", padx=14)
@@ -241,6 +252,8 @@ class App:
         # 가운데: 프리뷰 + 오른쪽 패널
         mid = ttk.PanedWindow(r, orient="horizontal")
         mid.grid(row=1, column=0, sticky="nsew", pady=(1, 0))
+        self.page_mid = mid
+        self.page = "edit"
         left = ttk.Frame(mid, style="TFrame")
         right = ttk.Frame(mid, style="Panel.TFrame", width=410)
         mid.add(left, weight=4)
@@ -387,6 +400,7 @@ class App:
         # 타임라인
         tlw = ttk.Frame(r, style="TFrame")
         tlw.grid(row=2, column=0, sticky="ew")
+        self.page_tl = tlw
         tb = ttk.Frame(tlw, style="Panel.TFrame", padding=(10, 5))
         tb.pack(fill="x", pady=(1, 0))
         btn(tb, "－", lambda: self._zoom_center(1.5), width=3).pack(side="left")
@@ -425,10 +439,14 @@ class App:
         bot.grid(row=3, column=0, sticky="ew", pady=(1, 0))
         self.status_lbl = ttk.Label(bot, text="준비", style="Panel.TLabel", width=70)
         self.status_lbl.pack(side="left")
-        self.cancel_btn = btn(bot, "취소", self.cancel, state="disabled")
+        self.cancel_btn = btn(bot, "중지", self.cancel, state="disabled")
         self.cancel_btn.pack(side="right")
+        self.pause_btn = btn(bot, "일시정지", self.toggle_job_pause, state="disabled", width=9)
+        self.pause_btn.pack(side="right", padx=(0, 4))
         self.prog = ttk.Progressbar(bot, maximum=1000)
         self.prog.pack(side="right", fill="x", expand=True, padx=8)
+
+        self._build_fix_page(r)
 
         if TkinterDnD and DND_FILES:
             try:
@@ -438,6 +456,181 @@ class App:
                 pass
         r.bind_all("<Key>", self._on_key)
         r.bind_all("<Control-o>", lambda e: self.open_file())
+
+    # ════════════════ 깨진 영상 복구 ════════════════
+    def _build_fix_page(self, r):
+        pg = ttk.Frame(r, style="Panel.TFrame", padding=(24, 18))
+        self.page_fix = pg
+        ttk.Label(pg, text="깨진 영상 복구", style="Head.TLabel", font=("맑은 고딕", 14, "bold")).pack(anchor="w")
+        ttk.Label(pg, text="녹화가 갑자기 멈춰 재생되지 않는 영상(삼성 녹화 .pending-… 파일 등)을 고칩니다. "
+                           "이름·확장자가 이상해도 그대로 넣으면 됩니다.", style="Sub.TLabel").pack(anchor="w", pady=(4, 14))
+        rf = ttk.Frame(pg, style="Panel.TFrame")
+        rf.pack(fill="x")
+        ttk.Label(rf, text="기준 영상", style="Panel.TLabel", width=10).pack(side="left")
+        self.ref_var = tk.StringVar(value=self.s.get("repair_ref", ""))
+        ttk.Entry(rf, textvariable=self.ref_var).pack(side="left", fill="x", expand=True, padx=6)
+        btn(rf, "선택", self.pick_ref).pack(side="left")
+        ttk.Label(pg, text="같은 폰·같은 녹화 기능·같은 화질로 정상 저장된 영상 하나 (짧아도 됩니다). "
+                           "한 번 정하면 계속 기억합니다.", style="Sub.TLabel").pack(anchor="w", padx=(86, 0), pady=(3, 12))
+        lf = ttk.Frame(pg, style="Panel.TFrame")
+        lf.pack(fill="both", expand=True)
+        cols = ("name", "size", "state")
+        self.ftree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended", height=6)
+        for c, t, w in zip(cols, ("파일", "크기", "상태"), (520, 100, 420)):
+            self.ftree.heading(c, text=t)
+            self.ftree.column(c, width=w, anchor="w" if c != "size" else "center", stretch=c != "size")
+        fsb = ttk.Scrollbar(lf, orient="vertical", command=self.ftree.yview)
+        self.ftree.configure(yscrollcommand=fsb.set)
+        self.ftree.pack(side="left", fill="both", expand=True)
+        fsb.pack(side="right", fill="y")
+        self.ftree.tag_configure("done", foreground="#6fd3a3")
+        self.ftree.tag_configure("err", foreground="#ff7b85")
+        bf = ttk.Frame(pg, style="Panel.TFrame")
+        bf.pack(fill="x", pady=(8, 0))
+        btn(bf, "깨진 파일 추가", self.add_broken_dialog).pack(side="left")
+        btn(bf, "빼기", self.remove_broken).pack(side="left", padx=4)
+        btn(bf, "목록 비우기", self.clear_broken).pack(side="left")
+        ttk.Label(bf, text="파일을 이 창에 끌어다 놓아도 됩니다.", style="Sub.TLabel").pack(side="left", padx=12)
+        of = ttk.Frame(pg, style="Panel.TFrame")
+        of.pack(fill="x", pady=(16, 0))
+        ttk.Label(of, text="저장 폴더", style="Panel.TLabel", width=10).pack(side="left")
+        self.fix_dir_var = tk.StringVar(value=self.s.get("repair_dir", ""))
+        ttk.Entry(of, textvariable=self.fix_dir_var).pack(side="left", fill="x", expand=True, padx=6)
+        btn(of, "선택", self.pick_fix_dir).pack(side="left")
+        btn(of, "원본 폴더로", lambda: self.fix_dir_var.set("")).pack(side="left", padx=4)
+        ttk.Label(pg, text="비워두면 깨진 파일과 같은 폴더에 '이름_복구.mp4'로 저장 (원본은 그대로 둡니다)",
+                  style="Sub.TLabel").pack(anchor="w", padx=(86, 0), pady=(3, 0))
+        cf = ttk.Frame(pg, style="Panel.TFrame")
+        cf.pack(fill="x", pady=(14, 0))
+        self.fix_add_var = tk.BooleanVar(value=bool(self.s.get("repair_add", True)))
+        ttk.Checkbutton(cf, text="복구한 영상을 '자르기·인코딩' 목록에 자동으로 추가", variable=self.fix_add_var,
+                        takefocus=0).pack(side="left")
+        self.fix_btn = btn(cf, "복구 시작", self.start_repair, "Accent.TButton")
+        self.fix_btn.pack(side="right")
+        self.broken = []        # [{path, state, msg, out}]
+
+    def show_page(self, page):
+        if page == self.page:
+            return
+        self.page = page
+        if page == "fix":
+            self.pause()
+            self.page_mid.grid_remove()
+            self.page_tl.grid_remove()
+            self.page_fix.grid(row=1, column=0, rowspan=2, sticky="nsew", pady=(1, 0))
+        else:
+            self.page_fix.grid_remove()
+            self.page_mid.grid()
+            self.page_tl.grid()
+        self.tab_edit.config(style="TabOn.TButton" if page == "edit" else "Tab.TButton")
+        self.tab_fix.config(style="TabOn.TButton" if page == "fix" else "Tab.TButton")
+
+    def pick_ref(self):
+        p = filedialog.askopenfilename(title="기준 영상 (정상 녹화 파일)",
+                                       initialdir=os.path.dirname(self.ref_var.get()) or self.s.get("last_dir") or None,
+                                       filetypes=[("영상 파일", " ".join("*" + x for x in VIDEO_EXT)), ("모든 파일", "*.*")])
+        if p:
+            self.ref_var.set(os.path.normpath(p))
+            self._save_fix_settings()
+
+    def pick_fix_dir(self):
+        d = filedialog.askdirectory(title="복구 파일 저장 폴더", initialdir=self.fix_dir_var.get() or None)
+        if d:
+            self.fix_dir_var.set(os.path.normpath(d))
+            self._save_fix_settings()
+
+    def _save_fix_settings(self):
+        self.s["repair_ref"] = self.ref_var.get().strip()
+        self.s["repair_dir"] = self.fix_dir_var.get().strip()
+        self.s["repair_add"] = self.fix_add_var.get()
+        self._save_settings_only()
+
+    def add_broken_dialog(self):
+        paths = filedialog.askopenfilenames(title="깨진 영상 파일 추가", initialdir=self.s.get("last_dir") or None,
+                                            filetypes=[("모든 파일", "*.*"), ("영상 파일", " ".join("*" + x for x in VIDEO_EXT))])
+        if paths:
+            self.add_broken(list(paths))
+
+    def add_broken(self, paths):
+        for p in paths:
+            p = os.path.normpath(os.path.abspath(p))
+            if not os.path.isfile(p) or any(b["path"] == p for b in self.broken):
+                continue
+            b = {"path": p, "state": "대기", "tag": ""}
+            self.broken.append(b)
+            self.ftree.insert("", "end", iid=p, values=(os.path.basename(p), f"{os.path.getsize(p) / 1048576:,.0f} MB",
+                                                        "대기"))
+
+    def _frow(self, b):
+        if self.ftree.exists(b["path"]):
+            self.ftree.item(b["path"], tags=(b.get("tag", ""),), values=(
+                os.path.basename(b["path"]), self.ftree.item(b["path"], "values")[1], b["state"]))
+
+    def remove_broken(self):
+        if self.exporting:
+            return
+        for iid in self.ftree.selection():
+            self.broken = [b for b in self.broken if b["path"] != iid]
+            self.ftree.delete(iid)
+
+    def clear_broken(self):
+        if self.exporting:
+            return
+        self.broken = []
+        self.ftree.delete(*self.ftree.get_children())
+
+    def start_repair(self):
+        if self.exporting:
+            messagebox.showinfo(APP_NAME, "다른 작업(내보내기·복구)이 끝난 뒤 시작해주세요.")
+            return
+        todo = [b for b in self.broken if b["state"] != "완료"]
+        if not todo:
+            messagebox.showinfo(APP_NAME, "복구할 파일을 목록에 넣어주세요.")
+            return
+        self._save_fix_settings()
+        ref = self.ref_var.get().strip()
+        d = self.fix_dir_var.get().strip()
+        self._set_exporting(True)
+        self.job = fftools.Job()
+        job = self.job
+        plan = [(b["path"], repair.default_out(b["path"], d)) for b in todo]
+        add = self.fix_add_var.get()
+
+        def work():
+            done = []
+            for k, (src, out) in enumerate(plan):
+                if job.cancelled:
+                    break
+                name = os.path.basename(src)
+                self.post("fix", src, "복구 중...", "")
+                try:
+                    msg = repair.repair(src, ref, out, job,
+                                        progress=lambda r, m, k=k: self.post("bprog", (k + r) / len(plan),
+                                                                             f"[{k + 1}/{len(plan)}] {name} — {m}"))
+                    self.post("fix", src, f"완료 → {os.path.basename(out)}  ·  {msg}", "done")
+                    done.append(out)
+                except Exception as e:
+                    if job.cancelled:
+                        self.post("fix", src, "중지됨", "")
+                        break
+                    self.post("fix", src, "실패: " + str(e).splitlines()[0], "err")
+                    self.post("fixerr", name, str(e))
+            self.post("fix_done", done, add, job.cancelled)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ════════════════ 작업 일시정지 ════════════════
+    def toggle_job_pause(self):
+        if not self.exporting or not self.job:
+            return
+        if self.job.paused:
+            self.job.resume()
+            self.pause_btn.config(text="일시정지")
+            self.status("이어서 진행합니다.")
+        else:
+            self.job.pause()
+            self.pause_btn.config(text="계속")
+            self.status("일시정지했습니다. '계속'을 누르면 멈춘 곳에서 이어갑니다. (프로그램을 꺼도 다음에 이어서 할 수 있어요)")
 
     # ════════════════ 공용 ════════════════
     def status(self, msg):
@@ -484,14 +677,36 @@ class App:
                 self.prog.config(value=0)
                 self.status(msg.splitlines()[0])
                 if msg != "취소됨":
-                    messagebox.showerror(APP_NAME, f"{os.path.basename(path)}\n\n{msg}")
+                    messagebox.showerror(APP_NAME, f"{os.path.basename(path)}\n\n{msg}\n\n"
+                                                   "녹화가 중간에 끊긴 파일이면 위쪽 '깨진 영상 복구'에서 고칠 수 있습니다.")
         elif kind == "item":
             it = self._item(m[1])
             if it:
+                changed = "state" in m[2] and m[2]["state"] != it.get("state")
                 it.update(m[2])
                 self._qrow(it)
+                if changed or "out" in m[2]:
+                    self._save_queue()          # 진행 상황 바로 저장
         elif kind == "batch_done":
             self._batch_done(m[1], m[2])
+        elif kind == "fix":
+            b = next((x for x in self.broken if x["path"] == m[1]), None)
+            if b:
+                b["state"] = "완료" if m[3] == "done" else m[2]
+                b["tag"] = m[3]
+                self._frow(b)
+                if m[3] == "done":
+                    self.ftree.set(b["path"], "state", m[2])
+        elif kind == "fixerr":
+            messagebox.showerror(APP_NAME, f"{m[1]}\n\n{m[2]}")
+        elif kind == "fix_done":
+            done, add, cancelled = m[1], m[2], m[3]
+            self._set_exporting(False)
+            self.prog.config(value=1000 if done else 0)
+            self.status(f"복구 {'중지' if cancelled else '끝'} — 성공 {len(done)}개")
+            if done and add:
+                self.add_files(done, select=False)
+                self.status(f"복구 끝 — {len(done)}개를 '자르기·인코딩' 목록에 추가했습니다.")
         elif kind == "upd":
             self.upd_btn.config(text=m[1])
 
@@ -500,7 +715,15 @@ class App:
         st = "disabled" if b else "normal"
         self.export_btn.config(state=st)
         self.one_btn.config(state=st)
+        self.fix_btn.config(state=st)
+        self.pause_btn.config(state="normal" if b else "disabled", text="일시정지")
         self.cancel_btn.config(state="normal" if b else ("normal" if self.fg_job else "disabled"))
+        self._update_export_btn()
+
+    def _update_export_btn(self):
+        n = sum(1 for it in self.items if it["include"] and it["state"] == "paused")
+        self.export_btn.config(text=f"이어서 내보내기 ({n}개 멈춤)" if n and not self.exporting
+                               else "체크한 영상 모두 내보내기")
 
     def _dur(self):
         return self.info["duration"] if self.info else 1.0
@@ -533,11 +756,17 @@ class App:
     # ════════════════ 열기·분석 ════════════════
     def _on_drop(self, e):
         files = [f for f in self.root.tk.splitlist(e.data) if os.path.isfile(f)]
+        if self.page == "fix":
+            self.add_broken(files)
+            return
         vids = [f for f in files if f.lower().endswith(VIDEO_EXT)] or files
         if vids:
             self.add_files(vids)
 
     def open_file(self, path=None):
+        if self.page == "fix" and not path:
+            self.add_broken_dialog()
+            return
         if path:
             self.add_files([path])
             return
@@ -602,6 +831,8 @@ class App:
             txt = f"내보내는 중 {int(it.get('pct', 0) * 100)}%"
         elif st == "done":
             txt = "완료"
+        elif st == "paused":
+            txt = f"멈춤 {int(it.get('pct', 0) * 100)}%"
         else:
             txt = "오류"
         tags = []
@@ -619,6 +850,7 @@ class App:
             fftools.fmt_time(it["dur"]) if it.get("dur") else "", txt))
         n_on = sum(1 for x in self.items if x["include"])
         self.q_lbl.config(text=f"{len(self.items)}개 · 출력 체크 {n_on}개")
+        self._update_export_btn()
 
     def _qtree_click(self, e):
         if self.qtree.identify_region(e.x, e.y) != "cell" or self.qtree.identify_column(e.x) != "#1":
@@ -671,8 +903,15 @@ class App:
             self._qrow(x)
 
     def _save_queue(self):
-        self.s["queue"] = [{"path": it["path"], "include": it["include"], "reviewed": it.get("reviewed", False),
-                            "done": it["state"] == "done"} for it in self.items]
+        q = []
+        for it in self.items:
+            st = it["state"]
+            if st == "exporting":
+                st = "paused"
+            q.append({"path": it["path"], "include": it["include"], "reviewed": it.get("reviewed", False),
+                      "done": st == "done", "state": st if st in ("done", "paused") else "",
+                      "pct": it.get("pct", 0.0) if st == "paused" else 0.0, "out": it.get("out", "")})
+        self.s["queue"] = q
         self.s["current"] = self.path
         self._save_settings_only()
 
@@ -688,10 +927,18 @@ class App:
                 it["reviewed"] = x.get("reviewed", False)
                 if x.get("done") and it["state"] == "ready":
                     it["state"] = "done"
+                elif x.get("state") == "paused":
+                    it["state"] = "paused"
+                    it["out"] = x.get("out", "")
+                    it["pct"] = x.get("pct", 0.0)
                 self._qrow(it)
         cur = self.s.get("current")
         target = self._item(os.path.normpath(cur)) if cur else None
         self.switch_to((target or self.items[0])["path"])
+        n = sum(1 for it in self.items if it["state"] == "paused")
+        if n:
+            self.root.after(1500, lambda: self.status(
+                f"지난번에 멈춘 내보내기가 {n}개 있습니다. 오른쪽 위 '이어서 내보내기'를 누르면 멈춘 곳부터 계속합니다."))
 
     def _clear_editor(self):
         self.pause()
@@ -831,7 +1078,7 @@ class App:
     def _on_analyzed(self, path, info, a, segs, restored):
         it = self._item(path)
         if it:
-            if it["state"] not in ("exporting", "done"):
+            if it["state"] not in ("exporting", "done", "paused"):
                 it["state"] = "ready"
             it["dur"] = info["duration"]
         if path != self.path:
@@ -1442,8 +1689,8 @@ class App:
             self.dir_var.set(os.path.normpath(d))
             self._save_settings_only()
 
-    def _out_path(self, src, taken):
-        d = self.dir_var.get().strip() or os.path.dirname(src)
+    def _out_path(self, src, taken, out_dir=None):
+        d = (self.dir_var.get().strip() if out_dir is None else out_dir) or os.path.dirname(src)
         stem = os.path.splitext(os.path.basename(src))[0]
         out = os.path.join(d, stem + "_편집.mp4")
         base, ext = os.path.splitext(out)
@@ -1471,6 +1718,11 @@ class App:
         if not todo:
             if any(it["include"] for it in self.items):
                 if messagebox.askyesno(APP_NAME, "체크한 영상이 모두 이미 완료 상태입니다. 다시 내보낼까요?"):
+                    for it in self.items:
+                        if it["include"] and it["state"] == "done":
+                            it["state"] = "ready"
+                            it["out"] = ""
+                            self._qrow(it)
                     todo = [it for it in self.items if it["include"]]
             else:
                 messagebox.showinfo(APP_NAME, "영상 목록에서 내보낼 영상을 체크(출력 칸)해주세요.")
@@ -1495,8 +1747,13 @@ class App:
             names += f"\n  ... 외 {len(todo) - 12}개"
         how = {"auto": "자동 (H.265 원본은 무손실, 그 외는 H.265 인코딩)", "copy": "무손실",
                "encode": "H.265 인코딩"}[mode]
+        resumed = sum(1 for it in todo if it["state"] == "paused")
         msg = (f"영상 {len(todo)}개를 순서대로 잘라서 저장합니다.\n\n{names}\n\n"
                f"저장 방식: {how}\n출력 폴더: {d or '각 원본과 같은 폴더'}")
+        if resumed:
+            msg += f"\n\n멈췄던 {resumed}개는 멈춘 곳부터 이어서 합니다."
+        if len(todo) > 1:
+            msg += "\n진행 중에 목록에 체크해서 넣은 영상도 이어서 처리합니다."
         if unrev:
             msg += f"\n\n※ 아직 열어보지 않은 영상 {len(unrev)}개는 자동으로 찾은 구간 그대로 잘립니다."
         if not messagebox.askyesno(APP_NAME, msg + "\n\n진행할까요?"):
@@ -1523,53 +1780,71 @@ class App:
         job = self.job
         settings = dict(self.s)
         cur_path, cur_segs = self.path, [dict(x) for x in self.segs] if self.analysis is not None else None
-        taken = set()
-        plan = []
+        settings["out_dir_now"] = d
         for it in todo:
-            out = self._out_path(it["path"], taken)
-            taken.add(out)
-            plan.append((it["path"], out, cur_segs if it["path"] == cur_path else None))
-        threading.Thread(target=self._batch_work, args=(plan, mode, settings, job), daemon=True).start()
+            if it["state"] == "error":
+                it["state"] = "ready"
+            if it["state"] != "paused":
+                it["pct"] = 0.0
+        self.batch_first = [it["path"] for it in todo]
+        self.batch_tried = set()
+        self._update_export_btn()
+        threading.Thread(target=self._batch_work, args=(mode, settings, job), daemon=True).start()
 
-    def _batch_work(self, plan, mode, settings, job):
-        n = len(plan)
+    def _next_batch_item(self):
+        """다음에 처리할 영상: 처음 고른 것들 먼저, 그 뒤 새로 체크된 것"""
+        items = list(self.items)
+        order = [self._item(p) for p in self.batch_first] + items
+        for it in order:
+            if it and it["include"] and it["state"] not in ("done", "error") and it["path"] not in self.batch_tried:
+                self.batch_tried.add(it["path"])
+                return dict(it)
+        return None
+
+    def _batch_work(self, mode, settings, job):
         results = []
-        for k, (path, out, segs) in enumerate(plan):
-            if job.cancelled:
+        k = 0
+        while not job.cancelled:
+            it = self._next_batch_item()
+            if it is None:
                 break
+            k += 1
+            path = it["path"]
             name = os.path.basename(path)
-            head = f"[{k + 1}/{n}] {name}"
+            out = it.get("out") or ""
+            if not out or os.path.exists(out):
+                out = self._out_path(path, set(), settings.get("out_dir_now", ""))
+            left = sum(1 for x in self.items if x["include"] and x["state"] not in ("done", "error")
+                       and x["path"] not in self.batch_tried)
+            head = f"[{k}번째 · 남은 {left}개] {name}"
 
-            def prog(r, m, k=k, path=path, head=head, part=(0.0, 1.0)):
+            def prog(r, m, path=path, head=head, part=(0.0, 1.0)):
                 a0, a1 = part
                 rr = a0 + (a1 - a0) * r
                 self.post("item", path, {"state": "exporting", "pct": rr})
-                self.post("bprog", (k + rr) / n, f"{head} — {m}")
+                self.post("bprog", rr, f"{head} — {m}{'  (일시정지)' if job.paused else ''}")
 
             try:
-                self.post("item", path, {"state": "exporting", "pct": 0.0})
+                self.post("item", path, {"state": "exporting", "out": out})
                 info = fftools.probe(path)
-                if segs is None:
-                    a = analyzer.analyze(path, info, settings,
-                                         progress=lambda r, m: prog(r, m, part=(0.0, 0.3)), job=job)
-                    sf = segs_file(path, int(a.fps))
-                    if os.path.isfile(sf):
-                        with open(sf, encoding="utf-8") as f:
-                            segs = json.load(f)
-                    else:
-                        segs = analyzer.detect(a, info["duration"], settings)
-                        with open(sf, "w", encoding="utf-8") as f:
-                            json.dump(segs, f, ensure_ascii=False)
-                    part = (0.3, 1.0)
+                a = analyzer.analyze(path, info, settings, progress=lambda r, m: prog(r, m, part=(0.0, 0.3)), job=job)
+                sf = segs_file(path, int(a.fps))
+                if os.path.isfile(sf):
+                    with open(sf, encoding="utf-8") as f:
+                        segs = json.load(f)
                 else:
-                    part = (0.0, 1.0)
+                    segs = analyzer.detect(a, info["duration"], settings)
+                    with open(sf, "w", encoding="utf-8") as f:
+                        json.dump(segs, f, ensure_ascii=False)
+                part = (0.0, 1.0)
                 msg = exporter.export(path, info, segs, out, mode, settings,
                                       progress=lambda r, m: prog(r, m, part=part), job=job)
                 self.post("item", path, {"state": "done", "pct": 1.0, "out": out})
                 results.append((path, out, True, msg.splitlines()[0]))
             except Exception as e:
                 if job.cancelled:
-                    self.post("item", path, {"state": "ready", "pct": 0.0})
+                    pct = exporter.encode_progress(path, out)
+                    self.post("item", path, {"state": "paused", "pct": pct, "out": out})
                     break
                 self.post("item", path, {"state": "error", "msg": str(e)})
                 results.append((path, out, False, str(e).splitlines()[0] if str(e) else "오류"))
@@ -1581,7 +1856,7 @@ class App:
         ok = [r for r in results if r[2]]
         bad = [r for r in results if not r[2]]
         self.prog.config(value=1000 if ok and not cancelled else 0)
-        head = "중간에 취소했습니다." if cancelled else "모두 끝났습니다."
+        head = "중지했습니다. (다음에 '이어서 내보내기'로 멈춘 곳부터 계속)" if cancelled else "모두 끝났습니다."
         lines = [f"{head}  완료 {len(ok)}개" + (f" · 실패 {len(bad)}개" if bad else "")]
         self.status(lines[0])
         for p, out, good, m in results[:15]:
@@ -1616,8 +1891,14 @@ class App:
             pass
 
     def on_close(self):
-        if self.exporting and not messagebox.askyesno(APP_NAME, "내보내는 중입니다. 취소하고 닫을까요?"):
+        if self.exporting and not messagebox.askyesno(
+                APP_NAME, "작업 중입니다. 멈추고 닫을까요?\n\n다음에 켜서 '이어서 내보내기'를 누르면 멈춘 곳부터 계속합니다."):
             return
+        if self.exporting:
+            for it in self.items:
+                if it["state"] == "exporting":
+                    it["state"] = "paused"
+                    it["pct"] = exporter.encode_progress(it["path"], it.get("out", ""))
         for j in (self.job, self.fg_job, self.aw_job):
             if j:
                 j.cancel()
@@ -1875,8 +2156,55 @@ def _ui_test(app, root):
     states = [it["state"] for it in app.items]
     print("batch out:", outs, codecs, states, flush=True)
     batch_ok = len(outs) == 2 and all(c == "hevc" for c in codecs) and states == ["done", "done"]
-    print(f"checks drag={drag_ok} scrub={scrub_ok} play={play_ok} tree={tree_ok} batch={batch_ok}", flush=True)
-    return drag_ok and scrub_ok and play_ok and tree_ok and batch_ok
+    # 일시정지 → 중지 → 이어서 내보내기 (조각 단위로 이어지는지)
+    exporter.CHUNK_SEC = 3
+    for it in app.items:
+        it["state"] = "ready"
+        it["out"] = ""
+        it["pct"] = 0.0
+    app.items[1]["include"] = False
+    app.mode_var.set(dict(EXPORT_MODES)["encode"])
+    outdir2 = tempfile.mkdtemp(prefix="videocut_resume_")
+    app.dir_var.set(outdir2)
+    app.export_all()
+    end = time.time() + 120
+    while app.items[0].get("pct", 0) < 0.4 and app.exporting and time.time() < end:
+        pump(0.05)
+    app.toggle_job_pause()
+    pump(1.0)
+    paused_ok = app.exporting and app.job.paused and app.pause_btn.cget("text") == "계속"
+    app.cancel()
+    end = time.time() + 30
+    while app.exporting and time.time() < end:
+        pump(0.1)
+    it0 = app.items[0]
+    saved = app.s["queue"][0]
+    print("stopped:", it0["state"], round(it0.get("pct", 0), 2), saved.get("state"), it0.get("out"), flush=True)
+    wroot = os.path.join(outdir2, ".videocut_work")
+    for dp, dn, fn in os.walk(wroot):
+        print("  work:", dp, sorted(fn), flush=True)
+    stop_ok = it0["state"] == "paused" and saved.get("state") == "paused" and it0.get("pct", 0) > 0.1
+    btn_ok = app.export_btn.cget("text").startswith("이어서")
+    app.export_all()
+    first_pct = None
+    end = time.time() + 300
+    while app.exporting and time.time() < end:
+        pump(0.05)
+        if first_pct is None and it0.get("state") == "exporting" and it0.get("pct", 0) > 0:
+            first_pct = it0["pct"]
+    outs2 = os.listdir(outdir2)
+    print("resumed from:", first_pct and round(first_pct, 2), "outs:", outs2, it0["state"], flush=True)
+    resume_ok = it0["state"] == "done" and len([f for f in outs2 if f.endswith("_편집.mp4")]) == 1 and \
+        not os.path.exists(os.path.join(outdir2, ".videocut_work"))
+    exporter.CHUNK_SEC = 120
+    # 복구 화면 전환
+    app.show_page("fix")
+    pump(0.3)
+    app.show_page("edit")
+    pump(0.3)
+    print(f"checks drag={drag_ok} scrub={scrub_ok} play={play_ok} tree={tree_ok} batch={batch_ok} "
+          f"pause={paused_ok} stop={stop_ok} btn={btn_ok} resume={resume_ok}", flush=True)
+    return all((drag_ok, scrub_ok, play_ok, tree_ok, batch_ok, paused_ok, stop_ok, btn_ok, resume_ok))
 
 
 def main():
@@ -1906,6 +2234,7 @@ def main():
                 print("ffmpeg:", fftools.FFMPEG, "ffplay:", bool(fftools.FFPLAY), flush=True)
                 ok = selftest.run(lambda *a: print(*a, flush=True))
                 ui = _ui_test(app, root)
+                ui = repair.selftest(lambda *a: print(*a, flush=True)) and ui
                 print("dnd:", bool(TkinterDnD), flush=True)
                 if ok and ui:
                     print("ui ok", flush=True)

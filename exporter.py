@@ -180,8 +180,9 @@ def _copy(path, info, keeps, out, wd, progress, job):
     return msg
 
 
-def plan_chunks(keeps, fps, chunk_sec=CHUNK_SEC):
+def plan_chunks(keeps, fps, chunk_sec=None):
     """남길 구간 → 프레임 단위 조각 [(시작 프레임, 프레임 수)], 구간 [(시작 프레임, 끝 프레임)]"""
+    chunk_sec = chunk_sec or CHUNK_SEC
     step = max(1, int(round(chunk_sec * fps)))
     chunks, ranges = [], []
     for s, e in keeps:
@@ -263,6 +264,8 @@ def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc):
     sig = {"src": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime), "enc": enc, "q": q,
            "ten": bool(info.get("ten_bit")), "fps": fps_str, "ranges": ranges, "chunks": len(chunks),
            "chunk_sec": CHUNK_SEC, "v": 1}
+    import json
+    sig = json.loads(json.dumps(sig))       # 저장된 것과 같은 형태로 비교 (튜플→목록)
     done = _load_manifest(wd, sig)
     total_f = sum(n for _, n in chunks)
     done_f = sum(chunks[i][1] for i in done)
