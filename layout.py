@@ -488,14 +488,15 @@ def trim_bars(path, plan, job=None):
             rb = _run(y + h - 1, -1, lim)
             # 아래쪽 중간의 두꺼운 화면 요소 띠(하트·목표 막대·설명 글) — 그 아래 채팅이 바뀌어도 띠부터 자름
             if rb < 2:
-                solid = ui & (exact >= 0.9)
+                solid = ui & (exact >= 0.6)
+                g2 = max(8, H // 80)                     # 글자 줄 사이·자라는 막대 등 짧은 틈은 이어 봄
                 r = y + h - 1
                 lo_lim = y + max(int(h * 0.5), top - y + int(H * 0.2))
                 while r > lo_lim:
                     if solid[r]:
                         e = r
                         k = r
-                        while k > lo_lim and (solid[k] or (k > lo_lim + gap and solid[k - gap:k].any())):
+                        while k > lo_lim and (solid[k] or (k > lo_lim + g2 and solid[k - g2:k].any())):
                             k -= 1
                         if e - k >= H * 0.04:
                             rb = y + h - (k + 1)
