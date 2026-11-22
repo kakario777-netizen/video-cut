@@ -2068,7 +2068,7 @@ class App:
                 msg = exporter.export(path, info, segs, out, mode, settings,
                                       progress=lambda r, m: prog(r, m, part=part), job=job, crop=crop)
                 self.post("item", path, {"state": "done", "pct": 1.0, "out": out})
-                results.append((path, out, True, msg.splitlines()[0]))
+                results.append((path, out, True, msg.splitlines()[0] + size_note(path, out)))
             except Exception as e:
                 if job.cancelled:
                     pct = exporter.encode_progress(path, out)
@@ -2148,6 +2148,16 @@ DEVICE_RATIOS = [
     (2376 / 968, "폴드6 바깥"),
     (3120 / 1440, "S24U·일반 폰"),
 ]
+
+
+def size_note(src, out):
+    """결과 메시지용: 원본 → 결과 용량"""
+    try:
+        a, b = os.path.getsize(src), os.path.getsize(out)
+        mb = lambda x: f"{x / 1073741824:.2f}GB" if x >= 1073741824 else f"{x / 1048576:.0f}MB"
+        return f"  [{mb(a)} → {mb(b)}, {max(0, 100 - b * 100 // max(1, a))}% 줄어듦]"
+    except OSError:
+        return ""
 
 
 def format_label(info):
