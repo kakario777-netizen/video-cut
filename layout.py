@@ -11,7 +11,7 @@ import analyzer
 import fftools
 
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
-LAYOUT_VERSION = 7                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
+LAYOUT_VERSION = 8                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
 ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
 STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
 ROW_STILL = 0.12    # 위·아래 가로 띠(상태바·내비바)는 깜빡이는 작은 표시(녹화 중 알약 등)까지 허용
@@ -409,10 +409,11 @@ def _frames(path, t0, t1, W, H, k):
 
 
 def trim_bars(path, plan, job=None):
-    """원본 장면 여러 장으로 위·아래 메뉴 띠를 확인해 더 자름 (남길 영역의 폭 안에서만 봄).
-    여러 장면에서 거의 그대로이고 바탕이 단색인 줄 = 상태바·메뉴바·탭바·버튼줄·목표 막대 등.
-    블러는 영상을 따라 바뀌므로 멀리 떨어진 장면끼리 같지 않아 지켜짐.
-    세로 모양 영역은 맨 위 상태바·맨 아래 내비바만 (채팅 유지)"""
+    """원본 장면 여러 장으로 위·아래 화면 요소를 확인해 더 자름 (남길 영역의 폭 안에서만 봄).
+    - 화면 요소(상태바·메뉴·탭바·버튼줄·목표 막대·설명 글): 장면이 바뀌어도 픽셀이 거의 '완전히' 같음
+    - 영상: 가만히 있는 벽·천장도 카메라 노이즈로 조금씩 흔들림 → 구분됨
+    - 블러: 영상을 따라 바뀌거나, 가만히 있어도 글자·선 없이 부드러움 → 지켜짐
+    세로 모양 영역은 맨 위 상태바·맨 아래 내비바만 (채팅 유지), 그 밖은 영상 덩어리만 남김"""
     if not plan or not plan.get("segs"):
         return plan
     W, H = plan["W"], plan["H"]
@@ -424,55 +425,93 @@ def trim_bars(path, plan, job=None):
         x, y, w, h = sg["rect"]
         st = _frames(path, sg["start"], sg["end"], W, H, 6 if sg["end"] - sg["start"] < 600 else 8)
         if st is None:
+            sg["dbg"] = "장면 못 뽑음"
             continue
         sub = st[:, :, x:x + w]
         rng = sub.max(axis=0) - sub.min(axis=0)
-        still = (rng <= 12).mean(axis=1)
+        exact = (rng <= 4).mean(axis=1)                       # 장면이 바뀌어도 거의 그대로인 비율
         f0 = sub[len(sub) // 2]
-        med = np.median(f0, axis=1, keepdims=True)
-        flat = (np.abs(f0 - med) <= 8).mean(axis=1)
+        med = np.median(f0, axis=1)
+        flat = (np.abs(f0 - med[:, None]) <= 8).mean(axis=1)
+        detail = np.zeros(H)
+        detail[:] = (np.abs(f0[:, 1:] - f0[:, :-1]) > EDGE).mean(axis=1)    # 글자·아이콘 등 또렷한 무늬
         pure = flat >= 0.95
         near = pure.copy()
         for dk in range(1, 5):
             near[dk:] |= pure[:-dk]
             near[:-dk] |= pure[dk:]
-        ui = (still >= 0.6) & ((flat >= 0.35) | ((flat >= 0.2) & near))
+        ui = (exact >= 0.6) & (pure | ((flat >= 0.2) & (near | (detail >= 0.01))))
         edge = np.zeros(H)
-        edge[1:] = (np.abs(f0[1:] - f0[:-1]) > EDGE).mean(axis=1)     # edge[r] = r-1 과 r 사이
+        edge[1:] = (np.abs(f0[1:] - f0[:-1]) > EDGE).mean(axis=1)           # edge[r] = r-1 과 r 사이
+        jump = np.zeros(H)
+        jump[1:] = np.abs(med[1:] - med[:-1])                              # 줄 바탕색이 바뀌는 곳
+        line = (edge >= LINE) | (jump >= 8)
         portrait = h > w * 1.6
-        # 위쪽: 가장자리부터 이어지는 메뉴 줄
-        run = 0
-        while run < H and ui[run]:
-            run += 1
-        top = 0
+        top, bot = 0, H
         if portrait:
+            run = 0
+            while run < H and ui[run]:
+                run += 1
             cap = int(H * TOP_MAX)
-            lines = [r for r in range(2, min(run + 2, cap + 1, H)) if edge[r] >= LINE and ui[:r].all()]
-            top = lines[0] if lines else (run if 2 <= run <= int(H * 0.04) else 0)
-        elif run >= 2:
-            top = min(run, int(H * 0.35))
-            lo_, hi_ = max(1, top - 4), min(H - 1, top + 4)
-            k = lo_ + int(np.argmax(edge[lo_:hi_ + 1]))
-            if edge[k] >= WEAK_LINE:
-                top = k
-        # 아래쪽
-        run = 0
-        while run < H and ui[H - 1 - run]:
-            run += 1
-        bot = H
-        if portrait:
+            c = [r for r in range(2, min(run + 2, cap + 1, H)) if line[r] and ui[:r].all()]
+            top = c[0] if c else (run if 2 <= run <= int(H * 0.045) else 0)
+            run = 0
+            while run < H and ui[H - 1 - run]:
+                run += 1
             cap = int(H * BOT_MAX)
-            lines = [r for r in range(H - 2, max(H - run - 2, H - cap - 1, 0), -1)
-                     if edge[r] >= LINE and ui[r:].all()]
-            bot = lines[0] if lines else (H - run if 2 <= run <= int(H * 0.05) else H)
-        elif run >= 2:
-            bot = max(H - run, int(H * 0.65))
-            lo_, hi_ = max(1, bot - 4), min(H - 1, bot + 4)
-            k = lo_ + int(np.argmax(edge[lo_:hi_ + 1]))
-            if edge[k] >= WEAK_LINE:
-                bot = k
+            c = [r for r in range(H - 2, max(H - run - 2, H - cap - 1, 0), -1) if line[r] and ui[r:].all()]
+            bot = c[0] if c else (H - run if 2 <= run <= int(H * 0.06) else H)
+        else:
+            # 남길 영역의 위·아래 가장자리부터 이어지는 화면 요소 줄 (프레임 끝에서 바뀌는 채팅이 있어도 됨)
+            score = np.maximum(edge, np.minimum(1.0, jump / 16.0))
+            gap = max(2, H // 200)
+
+            def _run(start, step, limit):
+                r, last = start, start - step
+                while 0 <= r < H and abs(r - start) < limit:
+                    if ui[r]:
+                        last = r
+                    elif abs(r - last) > gap:
+                        break
+                    r += step
+                return abs(last - start) + 1 if last != start - step else 0
+
+            lim = int(h * 0.35)
+            rt = _run(y, 1, lim)
+            top = y
+            if rt >= 2:
+                top = y + rt
+                lo_, hi_ = max(1, top - 4), min(H - 1, top + 8)
+                k = lo_ + int(np.argmax(score[lo_:hi_ + 1]))
+                if score[k] >= WEAK_LINE:
+                    top = k
+            rb = _run(y + h - 1, -1, lim)
+            # 아래쪽 중간의 두꺼운 화면 요소 띠(하트·목표 막대·설명 글) — 그 아래 채팅이 바뀌어도 띠부터 자름
+            if rb < 2:
+                solid = ui & (exact >= 0.9)
+                r = y + h - 1
+                lo_lim = y + max(int(h * 0.5), top - y + int(H * 0.2))
+                while r > lo_lim:
+                    if solid[r]:
+                        e = r
+                        k = r
+                        while k > lo_lim and (solid[k] or (k > lo_lim + gap and solid[k - gap:k].any())):
+                            k -= 1
+                        if e - k >= H * 0.04:
+                            rb = y + h - (k + 1)
+                            break
+                        r = k
+                    r -= 1
+            bot = y + h
+            if rb >= 2:
+                bot = y + h - rb
+                lo_, hi_ = max(1, bot - 8), min(H - 1, bot + 4)   # 압축 블록 번짐으로 띠가 조금 늦게 시작할 수 있음
+                k = lo_ + int(np.argmax(score[lo_:hi_ + 1]))
+                if score[k] >= WEAK_LINE:
+                    bot = k
         ny0 = max(y, _even_up(top))
         ny1 = min(y + h, _even_down(bot))
+        sg["dbg"] = f"장면 {len(st)}장, {'세로' if portrait else '일반'}, 위 {top} 아래 {bot}"
         if ny1 - ny0 >= H * 0.2 and (ny0, ny1) != (y, y + h):
             sg["rect"] = [x, ny0, w, ny1 - ny0]
     merged = []
@@ -709,6 +748,45 @@ def make_browser_live_sample(path):
     make_fold_browser_sample(path, live=True)
 
 
+def make_pinl_wall_sample(path):
+    """가로 녹화 속 세로 화면 — 영상 윗부분이 가만히 있는 흰 벽(카메라 노이즈), 그 위에 밝은 회색 상태바"""
+    graph = ("[3:v]noise=alls=12:allf=t[w];[w][0:v]vstack[cam];[2:v][cam]overlay=430:20[a];[a][1:v]overlay=470:250,"
+             "drawbox=x=430:y=0:w=250:h=20:c=0xe4e4e4:t=fill,drawbox=x=440:y=5:w=30:h=10:c=0x555555:t=fill,"
+             "drawbox=x=620:y=5:w=50:h=10:c=0x555555:t=fill,"
+             "drawbox=x=430:y=220:w=250:h=30:c=0x222222:t=fill,drawbox=x=520:y=225:w=50:h=20:c=0x558833:t=fill,"
+             "drawbox=x=430:y=250:w=40:h=265:c=0x2a2a2a:t=fill,"
+             "drawbox=x=430:y=515:w=250:h=25:c=0xf4f4f4:t=fill,drawbox=x=500:y=522:w=10:h=12:c=0x777777:t=fill,"
+             "drawbox=x=600:y=522:w=10:h=12:c=0x777777:t=fill[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=250x140:r=30:d=20",
+                              "-f", "lavfi", "-i", "life=s=210x265:mold=10:r=30:ratio=0.08:death_color=#202020:"
+                                                   "life_color=#bbbbbb,trim=duration=20",
+                              "-f", "lavfi", "-i", "color=c=black:s=1110x540:r=30:d=20",
+                              "-f", "lavfi", "-i", "color=c=0xf0f0f0:s=250x60:r=30:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "28", "-g", "60", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
+def make_browser_chat_sample(path):
+    """폴드 크롬 — 설명 글 아래에 계속 올라오는 채팅 (프레임 맨 아래가 계속 바뀜)"""
+    tmp = path + ".base.mp4"
+    make_fold_browser_sample(tmp, live=True)
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin", "-i", tmp,
+                              "-f", "lavfi", "-i", "life=s=520x160:mold=10:r=30:ratio=0.1:death_color=#202020:"
+                                                   "life_color=#cccccc,trim=duration=20",
+                              "-filter_complex", "[0:v][1:v]overlay=10:485[v]", "-map", "[v]",
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-g", "60",
+                              "-pix_fmt", "yuv420p", path], timeout=180)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
 SELFTEST_CASES = [
     ("phone", make_phone_sample, [63, 30, 1022, 510]),            # 가로 폰: 상태바·왼쪽 내비바·오른쪽 여백
     ("tab", make_tab_sample, [0, 58, 650, 402]),                  # 폴드형: 메뉴바·탭바·버튼줄·작업표시줄
@@ -718,6 +796,8 @@ SELFTEST_CASES = [
     ("browser", make_fold_browser_sample, [0, 80, 540, 290]),     # 폴드 안쪽 크롬
     ("browserlive", make_browser_live_sample, [0, 80, 540, 290]), # 목표 막대·하트 수가 바뀜
     ("pinl", make_portrait_in_landscape_sample, [430, 20, 250, 495]),  # 가로 녹화 속 세로 화면
+    ("pinlwall", make_pinl_wall_sample, [430, 20, 250, 495]),     # 상태바 아래 가만히 있는 흰 벽
+    ("browserchat", make_browser_chat_sample, [0, 80, 540, 290]), # 맨 아래 채팅이 계속 바뀜
 ]
 
 
