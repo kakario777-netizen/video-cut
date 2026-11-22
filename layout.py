@@ -505,8 +505,9 @@ def trim_bars(path, plan, job=None):
             bot = y + h
             if rb >= 2:
                 bot = y + h - rb
-                lo_, hi_ = max(1, bot - 8), min(H - 1, bot + 4)   # 압축 블록 번짐으로 띠가 조금 늦게 시작할 수 있음
-                k = lo_ + int(np.argmax(score[lo_:hi_ + 1]))
+                lo_, hi_ = max(1, bot - 12), min(H - 1, bot + 4)  # 압축 블록 번짐으로 띠가 조금 늦게 시작할 수 있음
+                strong = [r for r in range(lo_, hi_ + 1) if score[r] >= LINE]
+                k = strong[0] if strong else lo_ + int(np.argmax(score[lo_:hi_ + 1]))
                 if score[k] >= WEAK_LINE:
                     bot = k
         ny0 = max(y, _even_up(top))
