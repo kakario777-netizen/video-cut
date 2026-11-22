@@ -640,7 +640,9 @@ def make_portrait_sample(path):
 
 def make_fold_full_sample(path):
     """큰 화면 전체화면: 얇은 상태바(깜빡이는 빨간 표시) 바로 아래 영상, 영상 윗부분은 어둡고 가만히"""
-    graph = ("[0:v]drawbox=x=0:y=0:w=650:h=70:c=black@0.75:t=fill[vid];[1:v][vid]overlay=0:14,"
+    # 영상 윗부분은 어두운 장면 (실제처럼 노이즈로 조금씩 흔들림)
+    graph = ("[0:v]split[m][t];[t]crop=650:70:0:0,noise=alls=40:allf=t,"
+             "colorlevels=romax=0.25:gomax=0.25:bomax=0.25[dk];[m][dk]overlay=0:0[vid];[1:v][vid]overlay=0:14,"
              "drawbox=x=0:y=0:w=650:h=14:c=black:t=fill,drawbox=x=10:y=2:w=50:h=9:c=0xcc2222:t=fill:"
              "enable='lt(mod(t\\,1)\\,0.5)',drawbox=x=70:y=3:w=20:h=8:c=white:t=fill,"
              "drawbox=x=560:y=3:w=70:h=8:c=white:t=fill[v]")
