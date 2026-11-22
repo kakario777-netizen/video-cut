@@ -669,7 +669,7 @@ def make_portrait_sample(path):
              "drawbox=x=262:y=1280:w=20:h=20:c=0x777777:t=fill[v]")
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
                               "-f", "lavfi", "-i", "testsrc2=s=540x512:r=24:d=20",
-                              "-f", "lavfi", "-i", "life=s=440x620:mold=10:r=24:ratio=0.08:death_color=#202020:"
+                              "-f", "lavfi", "-i", "life=s=440x620:seed=7:mold=10:r=24:ratio=0.08:death_color=#202020:"
                                                    "life_color=#bbbbbb,trim=duration=10,"
                                                    "tpad=stop_mode=clone:stop_duration=10",
                               "-f", "lavfi", "-i", "color=c=0x1a1a1a:s=540x1320:r=24:d=20",
@@ -736,7 +736,7 @@ def make_portrait_in_landscape_sample(path):
              "drawbox=x=600:y=522:w=10:h=12:c=0x777777:t=fill[v]")
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
                               "-f", "lavfi", "-i", "testsrc2=s=250x200:r=30:d=20",
-                              "-f", "lavfi", "-i", "life=s=210x265:mold=10:r=30:ratio=0.08:death_color=#202020:"
+                              "-f", "lavfi", "-i", "life=s=210x265:seed=7:mold=10:r=30:ratio=0.08:death_color=#202020:"
                                                    "life_color=#bbbbbb,trim=duration=20",
                               "-f", "lavfi", "-i", "color=c=black:s=1110x540:r=30:d=20",
                               "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
@@ -761,7 +761,7 @@ def make_pinl_wall_sample(path):
              "drawbox=x=600:y=522:w=10:h=12:c=0x777777:t=fill[v]")
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
                               "-f", "lavfi", "-i", "testsrc2=s=250x140:r=30:d=20",
-                              "-f", "lavfi", "-i", "life=s=210x265:mold=10:r=30:ratio=0.08:death_color=#202020:"
+                              "-f", "lavfi", "-i", "life=s=210x265:seed=7:mold=10:r=30:ratio=0.08:death_color=#202020:"
                                                    "life_color=#bbbbbb,trim=duration=20",
                               "-f", "lavfi", "-i", "color=c=black:s=1110x540:r=30:d=20",
                               "-f", "lavfi", "-i", "color=c=0xf0f0f0:s=250x60:r=30:d=20",
@@ -776,9 +776,8 @@ def make_browser_chat_sample(path):
     tmp = path + ".base.mp4"
     make_fold_browser_sample(tmp, live=True)
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin", "-i", tmp,
-                              "-f", "lavfi", "-i", "life=s=520x160:mold=10:r=30:ratio=0.1:death_color=#202020:"
-                                                   "life_color=#cccccc,trim=duration=20",
-                              "-filter_complex", "[0:v][1:v]overlay=10:485[v]", "-map", "[v]",
+                              "-f", "lavfi", "-i", "testsrc2=s=520x160:r=30:d=20",
+                              "-filter_complex", "[1:v]hue=s=0,eq=contrast=0.6[c];[0:v][c]overlay=10:485[v]", "-map", "[v]",
                               "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-g", "60",
                               "-pix_fmt", "yuv420p", path], timeout=180)
     try:
