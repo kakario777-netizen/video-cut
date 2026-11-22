@@ -334,9 +334,9 @@ class App:
         self.q_lbl.pack(side="left", padx=8)
         qf = ttk.Frame(qp, style="Panel.TFrame")
         qf.pack(fill="both", expand=True, pady=(6, 0))
-        qcols = ("chk", "name", "len", "state")
+        qcols = ("chk", "name", "len", "fmt", "state")
         self.qtree = ttk.Treeview(qf, columns=qcols, show="headings", selectmode="browse", height=4)
-        for c, t, w in zip(qcols, ("출력", "파일", "길이", "상태"), (44, 170, 66, 96)):
+        for c, t, w in zip(qcols, ("출력", "파일", "길이", "형식", "상태"), (40, 130, 58, 150, 84)):
             self.qtree.heading(c, text=t)
             self.qtree.column(c, width=w, anchor="w" if c == "name" else "center", stretch=c == "name")
         qsb = ttk.Scrollbar(qf, orient="vertical", command=self.qtree.yview)
@@ -888,10 +888,10 @@ class App:
 
     def _probe_len(self, path):
         try:
-            d = fftools.probe(path)["duration"]
-            self.post("item", path, {"dur": d})
+            info = fftools.probe(path)
+            self.post("item", path, {"dur": info["duration"], "fmt": format_label(info)})
         except Exception:
-            pass
+            self.post("item", path, {"fmt": "읽을 수 없음"})
 
     def _qrow(self, it):
         if not self.qtree.exists(it["path"]):
@@ -923,7 +923,7 @@ class App:
         name = os.path.basename(it["path"])
         self.qtree.item(it["path"], tags=tags, values=(
             "✔" if it["include"] else "—", ("▶ " if it["path"] == self.path else "") + name,
-            fftools.fmt_time(it["dur"]) if it.get("dur") else "", txt))
+            fftools.fmt_time(it["dur"]) if it.get("dur") else "", it.get("fmt", ""), txt))
         n_on = sum(1 for x in self.items if x["include"])
         self.q_lbl.config(text=f"{len(self.items)}개 · 출력 체크 {n_on}개")
         self._update_export_btn()
@@ -2137,6 +2137,32 @@ class App:
         self._save_state()
         self._save_queue()
         self.root.destroy()
+
+# 화면 비율로 짐작하는 기기 (녹화 해상도는 줄어들 수 있어도 비율은 그대로)
+DEVICE_RATIOS = [
+    (2208 / 1768, "폴드3 안쪽"),
+    (2176 / 1812, "폴드4·5 안쪽"),
+    (2160 / 1856, "폴드6 안쪽"),
+    (2268 / 832, "폴드3·4 바깥"),
+    (2316 / 904, "폴드5 바깥"),
+    (2376 / 968, "폴드6 바깥"),
+    (3120 / 1440, "S24U·일반 폰"),
+]
+
+
+def format_label(info):
+    """목록 '형식' 칸: 코덱 해상도 · 비율로 짐작한 기기"""
+    codec = {"hevc": "HEVC", "h264": "H264", "av1": "AV1", "vp9": "VP9"}.get(info.get("vcodec", ""),
+                                                                           info.get("vcodec", "?").upper())
+    w, h = info.get("disp_w") or info.get("width"), info.get("disp_h") or info.get("height")
+    label = f"{codec} {w}×{h}"
+    if w and h:
+        r = max(w, h) / min(w, h)
+        best = min(DEVICE_RATIOS, key=lambda d: abs(d[0] - r))
+        if abs(best[0] - r) < 0.008:
+            label += f" · ≈{best[1]}"        # 비율로 짐작한 것이라 ≈ 표시
+    return label
+
 
 def save_diagnostic(path, info, a, crop):
     """자동 크롭 문제 확인용: 화면 그림(썸네일) 없이 줄·칸별 숫자 통계만 바탕화면에 저장"""
