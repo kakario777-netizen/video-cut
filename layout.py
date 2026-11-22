@@ -11,7 +11,7 @@ import analyzer
 import fftools
 
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
-LAYOUT_VERSION = 6                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
+LAYOUT_VERSION = 7                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
 ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
 STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
 ROW_STILL = 0.12    # 위·아래 가로 띠(상태바·내비바)는 깜빡이는 작은 표시(녹화 중 알약 등)까지 허용
@@ -271,6 +271,9 @@ def detect(a, info):
         rw, rh = min(rw, W - rx), min(rh, H - ry)
         st = 0.0 if i == 0 else _switch_time(a, sg["w0"])
         en = dur if i == len(merged) - 1 else _switch_time(a, sg["w1"])
+        if rw * 1.6 < H:
+            # 양옆을 잘랐더니 세로 모양(가로 녹화 속 세로 화면) → 세로 규칙: 위아래는 상태바·내비바만 (나중에 확인)
+            ry, rh = 0, H // 2 * 2
         out.append({"start": round(st, 2), "end": round(en, 2), "rect": [rx, ry, rw, rh], "on": True})
     # 이어지는 같은 영역 합치기
     final = []
@@ -391,6 +394,97 @@ def refine(path, info, plan, job=None):
     return plan
 
 
+def _frames(path, t0, t1, W, H, k):
+    """구간 [t0, t1] 에서 고르게 k 장 (원본 해상도, 흑백)"""
+    out = []
+    span = max(0.0, t1 - t0)
+    for i in range(k):
+        t = t0 + span * (0.06 + 0.88 * (i + 0.5) / k)
+        im = fftools.frame_at(path, t, W)
+        if im is not None:
+            g = np.asarray(im.convert("L"), dtype=np.int16)
+            if g.shape == (H, W):
+                out.append(g)
+    return np.stack(out) if len(out) >= 3 else None
+
+
+def trim_bars(path, plan, job=None):
+    """원본 장면 여러 장으로 위·아래 메뉴 띠를 확인해 더 자름 (남길 영역의 폭 안에서만 봄).
+    여러 장면에서 거의 그대로이고 바탕이 단색인 줄 = 상태바·메뉴바·탭바·버튼줄·목표 막대 등.
+    블러는 영상을 따라 바뀌므로 멀리 떨어진 장면끼리 같지 않아 지켜짐.
+    세로 모양 영역은 맨 위 상태바·맨 아래 내비바만 (채팅 유지)"""
+    if not plan or not plan.get("segs"):
+        return plan
+    W, H = plan["W"], plan["H"]
+    for sg in plan["segs"]:
+        if job and job.cancelled:
+            break
+        if sg.get("manual"):
+            continue
+        x, y, w, h = sg["rect"]
+        st = _frames(path, sg["start"], sg["end"], W, H, 6 if sg["end"] - sg["start"] < 600 else 8)
+        if st is None:
+            continue
+        sub = st[:, :, x:x + w]
+        rng = sub.max(axis=0) - sub.min(axis=0)
+        still = (rng <= 12).mean(axis=1)
+        f0 = sub[len(sub) // 2]
+        med = np.median(f0, axis=1, keepdims=True)
+        flat = (np.abs(f0 - med) <= 8).mean(axis=1)
+        pure = flat >= 0.95
+        near = pure.copy()
+        for dk in range(1, 5):
+            near[dk:] |= pure[:-dk]
+            near[:-dk] |= pure[dk:]
+        ui = (still >= 0.6) & ((flat >= 0.35) | ((flat >= 0.2) & near))
+        edge = np.zeros(H)
+        edge[1:] = (np.abs(f0[1:] - f0[:-1]) > EDGE).mean(axis=1)     # edge[r] = r-1 과 r 사이
+        portrait = h > w * 1.6
+        # 위쪽: 가장자리부터 이어지는 메뉴 줄
+        run = 0
+        while run < H and ui[run]:
+            run += 1
+        top = 0
+        if portrait:
+            cap = int(H * TOP_MAX)
+            lines = [r for r in range(2, min(run + 2, cap + 1, H)) if edge[r] >= LINE and ui[:r].all()]
+            top = lines[0] if lines else (run if 2 <= run <= int(H * 0.04) else 0)
+        elif run >= 2:
+            top = min(run, int(H * 0.35))
+            lo_, hi_ = max(1, top - 4), min(H - 1, top + 4)
+            k = lo_ + int(np.argmax(edge[lo_:hi_ + 1]))
+            if edge[k] >= WEAK_LINE:
+                top = k
+        # 아래쪽
+        run = 0
+        while run < H and ui[H - 1 - run]:
+            run += 1
+        bot = H
+        if portrait:
+            cap = int(H * BOT_MAX)
+            lines = [r for r in range(H - 2, max(H - run - 2, H - cap - 1, 0), -1)
+                     if edge[r] >= LINE and ui[r:].all()]
+            bot = lines[0] if lines else (H - run if 2 <= run <= int(H * 0.05) else H)
+        elif run >= 2:
+            bot = max(H - run, int(H * 0.65))
+            lo_, hi_ = max(1, bot - 4), min(H - 1, bot + 4)
+            k = lo_ + int(np.argmax(edge[lo_:hi_ + 1]))
+            if edge[k] >= WEAK_LINE:
+                bot = k
+        ny0 = max(y, _even_up(top))
+        ny1 = min(y + h, _even_down(bot))
+        if ny1 - ny0 >= H * 0.2 and (ny0, ny1) != (y, y + h):
+            sg["rect"] = [x, ny0, w, ny1 - ny0]
+    merged = []
+    for sg in plan["segs"]:
+        if merged and merged[-1]["rect"] == sg["rect"] and abs(merged[-1]["end"] - sg["start"]) < 0.5:
+            merged[-1]["end"] = sg["end"]
+        else:
+            merged.append(sg)
+    plan["segs"] = [sg for sg in merged if not _is_full(sg["rect"], W, H)]
+    return plan
+
+
 def plan_file(path, fps):
     return analyzer.cache_path(path, fps)[:-4] + ".crop.json"
 
@@ -418,14 +512,26 @@ def get(path, info, a, job=None):
         manual = any(sg.get("manual") for sg in p.get("segs", []))
         if manual or p.get("lv") == LAYOUT_VERSION:
             return p                 # 직접 지정한 크롭은 그대로
-    p = detect(a, info)
-    if p and p["segs"]:
-        p = refine(path, info, p, job)
+    p = compute(path, info, a, job)
     if job is not None and job.cancelled:
         return p
     p = p or {"W": info.get("disp_w"), "H": info.get("disp_h"), "segs": []}
     p["lv"] = LAYOUT_VERSION
     save(path, int(a.fps), p)
+    return p
+
+
+def compute(path, info, a, job=None):
+    """자동 크롭 계산 전체: 분석 기록으로 대략 → 원본 화소로 경계 맞춤 → 원본 장면으로 위·아래 띠 확인"""
+    p = detect(a, info)
+    if p and p["segs"]:
+        p = refine(path, info, p, job)
+    if p is not None and not p["segs"]:
+        # 자동 판단으로 자를 게 없어도 위·아래 메뉴 띠는 원본 장면으로 한 번 더 확인
+        p["segs"] = [{"start": 0.0, "end": info["duration"], "rect": [0, 0, p["W"] // 2 * 2, p["H"] // 2 * 2],
+                      "on": True}]
+    if p is not None:
+        p = trim_bars(path, p, job)
     return p
 
 
@@ -552,7 +658,7 @@ def make_tab_dark_sample(path):
     make_tab_sample(path, dark_top=True)
 
 
-def make_fold_browser_sample(path):
+def make_fold_browser_sample(path, live=False):
     """폴드 안쪽(세로 1.2 비율) 크롬: 주소창, 빨간 메뉴바, 회색 탭바, 영상, 하트·팁 줄, 목표 막대, 설명 글"""
     tabs = "".join(f",drawbox=x={x}:y=63:w=40:h=9:c=0xdddddd:t=fill" for x in (40, 110, 170, 230, 330, 440))
     graph = ("[0:v]drawbox=x=0:y=0:w=540:h=50:c=black@0.75:t=fill[vid];[1:v][vid]overlay=0:80,"
@@ -562,7 +668,10 @@ def make_fold_browser_sample(path):
              "drawbox=x=420:y=36:w=14:h=12:c=white:t=fill,drawbox=x=0:y=56:w=540:h=24:c=0x333333:t=fill" + tabs +
              ",drawbox=x=0:y=370:w=540:h=110:c=0x222222:t=fill,drawbox=x=10:y=376:w=80:h=22:c=0x444444:t=fill,"
              "drawbox=x=20:y=381:w=12:h=12:c=0xdd3344:t=fill,drawbox=x=380:y=376:w=150:h=22:c=0xbb9900:t=fill,"
-             "drawbox=x=10:y=408:w=330:h=18:c=0x666666:t=fill,drawbox=x=10:y=408:w=200:h=18:c=0x557711:t=fill,"
+             "drawbox=x=10:y=408:w=330:h=18:c=0x666666:t=fill,"
+             + ("drawbox=x=10:y=408:w='120+t*8':h=18:c=0x557711:t=fill,"
+                "drawbox=x=40:y=381:w=30:h=12:c=white:t=fill:enable='lt(mod(t\\,3)\\,1.5)',"
+                if live else "drawbox=x=10:y=408:w=200:h=18:c=0x557711:t=fill,") +
              "drawbox=x=10:y=440:w=420:h=8:c=0xbbbbbb:t=fill,drawbox=x=10:y=456:w=160:h=8:c=0xbbbbbb:t=fill[v]")
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
                               "-f", "lavfi", "-i", "testsrc2=s=540x290:r=30:d=20",
@@ -573,15 +682,53 @@ def make_fold_browser_sample(path):
         raise RuntimeError(err[-300:])
 
 
+def make_portrait_in_landscape_sample(path):
+    """가로 녹화(1110x540) 가운데에 세로 화면: 양옆 검은 여백, 상태바, 영상, 팁 줄, 채팅, 내비바"""
+    graph = ("[2:v][0:v]overlay=430:20[a];[a][1:v]overlay=470:250,"
+             "drawbox=x=430:y=0:w=250:h=20:c=0xdddddd:t=fill,drawbox=x=440:y=5:w=30:h=10:c=0x333333:t=fill,"
+             "drawbox=x=620:y=5:w=50:h=10:c=0x333333:t=fill,"
+             "drawbox=x=430:y=220:w=250:h=30:c=0x222222:t=fill,drawbox=x=520:y=225:w=50:h=20:c=0x558833:t=fill,"
+             "drawbox=x=430:y=250:w=40:h=265:c=0x2a2a2a:t=fill,"
+             "drawbox=x=430:y=515:w=250:h=25:c=0xf4f4f4:t=fill,drawbox=x=500:y=522:w=10:h=12:c=0x777777:t=fill,"
+             "drawbox=x=600:y=522:w=10:h=12:c=0x777777:t=fill[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=250x200:r=30:d=20",
+                              "-f", "lavfi", "-i", "life=s=210x265:mold=10:r=30:ratio=0.08:death_color=#202020:"
+                                                   "life_color=#bbbbbb,trim=duration=20",
+                              "-f", "lavfi", "-i", "color=c=black:s=1110x540:r=30:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "28", "-g", "60", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
+def make_browser_live_sample(path):
+    """폴드 브라우저 + 목표 막대가 계속 차오르고 하트 수가 바뀌는 경우"""
+    make_fold_browser_sample(path, live=True)
+
+
+SELFTEST_CASES = [
+    ("phone", make_phone_sample, [63, 30, 1022, 510]),            # 가로 폰: 상태바·왼쪽 내비바·오른쪽 여백
+    ("tab", make_tab_sample, [0, 58, 650, 402]),                  # 폴드형: 메뉴바·탭바·버튼줄·작업표시줄
+    ("portrait", make_portrait_sample, [0, 48, 540, 1212]),       # 세로: 상태바·내비바만, 채팅 유지
+    ("foldfull", make_fold_full_sample, [0, 14, 650, 526]),       # 큰 화면 전체화면: 얇은 상태바
+    ("tabdark", make_tab_dark_sample, [0, 58, 650, 402]),         # 어두운 탭바(흐린 경계)
+    ("browser", make_fold_browser_sample, [0, 80, 540, 290]),     # 폴드 안쪽 크롬
+    ("browserlive", make_browser_live_sample, [0, 80, 540, 290]), # 목표 막대·하트 수가 바뀜
+    ("pinl", make_portrait_in_landscape_sample, [430, 20, 250, 495]),  # 가로 녹화 속 세로 화면
+]
+
+
 def selftest(log=print):
     import tempfile
     import exporter
     d = tempfile.mkdtemp(prefix="videocut_crop_")
+    # 블러 살리기 + 구성이 바뀌는 시점 + 실제 저장 결과
     src = os.path.join(d, "crop_test.mp4")
     make_sample(src)
     info = fftools.probe(src)
     a = analyzer.analyze(src, info, analyzer.DEFAULTS, use_cache=False)
-    plan = refine(src, info, detect(a, info))
+    plan = compute(src, info, a)
     act = active_segs(plan)
     log(f"crop plan: {act}")
     ok = len(act) == 1 and abs(act[0][0] - 10) < 0.6 and abs(act[0][1] - 25) < 0.6 and \
@@ -595,45 +742,14 @@ def selftest(log=print):
     center = g is not None and g[150:210, 280:360].mean() > 40
     log(f"crop out: {o['width']}x{o['height']} {o['vcodec']} black_edge={black_edge} center={center}")
     ok = ok and o["width"] == 640 and o["height"] == 360 and black_edge and center
-    # 폰 가로 녹화 (녹화 잡음이 있는 상태바·내비바)
-    src2 = os.path.join(d, "phone.mp4")
-    make_phone_sample(src2)
-    info2 = fftools.probe(src2)
-    a2 = analyzer.analyze(src2, info2, analyzer.DEFAULTS, use_cache=False)
-    act2 = active_segs(refine(src2, info2, detect(a2, info2)))
-    log(f"phone crop: {act2}")
-    ok2 = len(act2) == 1 and all(abs(u - v) <= 4 for u, v in zip(act2[0][2], [63, 30, 1022, 510]))
-    src3 = os.path.join(d, "tab.mp4")
-    make_tab_sample(src3)
-    info3 = fftools.probe(src3)
-    a3 = analyzer.analyze(src3, info3, analyzer.DEFAULTS, use_cache=False)
-    act3 = active_segs(refine(src3, info3, detect(a3, info3)))
-    log(f"tab crop: {act3}")
-    ok3 = len(act3) == 1 and all(abs(u - v) <= 4 for u, v in zip(act3[0][2], [0, 58, 650, 402]))
-    src4 = os.path.join(d, "portrait.mp4")
-    make_portrait_sample(src4)
-    info4 = fftools.probe(src4)
-    a4 = analyzer.analyze(src4, info4, analyzer.DEFAULTS, use_cache=False)
-    act4 = active_segs(refine(src4, info4, detect(a4, info4)))
-    log(f"portrait crop: {act4}")
-    ok4 = len(act4) == 1 and all(abs(u - v) <= 6 for u, v in zip(act4[0][2], [0, 48, 540, 1212]))
-    src5 = os.path.join(d, "foldfull.mp4")
-    make_fold_full_sample(src5)
-    info5 = fftools.probe(src5)
-    a5 = analyzer.analyze(src5, info5, analyzer.DEFAULTS, use_cache=False)
-    act5 = active_segs(refine(src5, info5, detect(a5, info5)))
-    log(f"foldfull crop: {act5}")
-    ok5 = len(act5) == 1 and all(abs(u - v) <= 4 for u, v in zip(act5[0][2], [0, 14, 650, 526]))
-    extra_ok = True
-    for nm, mk, want in (("tabdark", make_tab_dark_sample, [0, 58, 650, 402]),
-                         ("browser", make_fold_browser_sample, [0, 80, 540, 290])):
-        sp = os.path.join(d, nm + ".mp4")
+    for name, mk, want in SELFTEST_CASES:
+        sp = os.path.join(d, name + ".mp4")
         mk(sp)
         ii = fftools.probe(sp)
         aa = analyzer.analyze(sp, ii, analyzer.DEFAULTS, use_cache=False)
-        act_ = active_segs(refine(sp, ii, detect(aa, ii)))
-        log(f"{nm} crop: {act_}")
-        extra_ok = extra_ok and len(act_) == 1 and all(abs(u - v) <= 4 for u, v in zip(act_[0][2], want))
-    ok = ok and ok2 and ok3 and ok4 and ok5 and extra_ok
+        act_ = active_segs(compute(sp, ii, aa))
+        good = len(act_) == 1 and all(abs(u - v) <= 4 for u, v in zip(act_[0][2], want))
+        log(f"{name} crop: {[r for _, _, r in act_]} {'ok' if good else 'FAIL want ' + str(want)}")
+        ok = ok and good
     log("crop ok" if ok else "crop FAIL")
     return ok
