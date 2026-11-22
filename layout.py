@@ -11,7 +11,7 @@ import analyzer
 import fftools
 
 GW, GH = analyzer.W, analyzer.H     # 분석 격자 320x180
-LAYOUT_VERSION = 3                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
+LAYOUT_VERSION = 4                  # 크롭 계산 방식이 바뀌면 올림 → 저장된 자동 결과를 다시 계산
 ACT = 0.01          # 줄·칸이 '움직인다'로 볼 비율 (내용이 시작되는 곳 찾기)
 STILL = 0.03        # 이 비율 미만만 움직이면 '가만히 있는' 화면 요소로 봄 (녹화 잡음 허용)
 ROW_STILL = 0.12    # 위·아래 가로 띠(상태바·내비바)는 깜빡이는 작은 표시(녹화 중 알약 등)까지 허용
@@ -22,14 +22,16 @@ SMOOTH = 0          # 앞뒤 몇 묶음(2초)을 합쳐 판단 (넓으면 구성
 MIN_SEG = 2         # 구성 구간 최소 길이(묶음 수)
 
 
-def _motion_span(prof):
-    idx = np.where(prof > ACT)[0]
+def _motion_span(prof, thr=ACT):
+    idx = np.where(prof > thr)[0]
+    if len(idx) == 0 and thr > ACT:
+        idx = np.where(prof > ACT)[0]
     if len(idx) == 0:
         return None
     return int(idx[0]), int(idx[-1]) + 1
 
 
-def _expand(lo, hi, flat, act, n):
+def _expand(lo, hi, flat, act, n, still=STILL):
     """움직이는 범위 [lo,hi) 에서 바깥으로 넓혀 감: 단색·정지 줄이 MIN_RUN 이상 이어지는 곳에서 멈춤"""
     need = max(MIN_RUN, int(round(n * 0.025)))      # 채팅 줄 사이 틈 같은 얇은 단색은 무시
 
@@ -38,7 +40,7 @@ def _expand(lo, hi, flat, act, n):
         run = 0
         cut = stop
         while i != stop:
-            ui = flat[i] >= FLAT and act[i] <= STILL
+            ui = flat[i] >= FLAT and act[i] <= still
             if ui:
                 run += 1
                 if run >= need or (i + step == stop and run >= MIN_RUN):
@@ -91,6 +93,39 @@ def _bar_cut(lo, hi, flat, act, edge, n, still=STILL):
     return top, bot
 
 
+TOP_MAX = 0.07      # 맨 위 얇은 띠(상태바) 최대 두께
+BOT_MAX = 0.10      # 맨 아래 얇은 띠(내비바) 최대 두께
+
+
+def _thin_bars(flat, act, edge, n):
+    """맨 위·아래 얇은 띠(상태바·내비바): 가장자리부터 이어지는 '가만히 있는 단색 띠'를 찾고,
+    그 안에서 가장자리에 가장 가까운 곧은 선에서 자름. → (위에서 자를 줄, 아래에서 자를 줄) 또는 None"""
+    ui = (flat >= UI_FLAT) & (act <= ROW_STILL)
+    top = None
+    k = 0
+    while k < n and ui[k] and k < int(n * TOP_MAX) + 1:
+        k += 1
+    if k >= 2:
+        for L in range(2, min(k + 2, n)):          # 가장자리에서 가까운 첫 뚜렷한 선 = 상태바 아래 경계
+            if edge[L - 1] >= LINE and all(ui[:L - 1]):
+                top = L
+                break
+        if top is None and k <= int(n * 0.04) and k < n and not ui[k]:
+            top = k                                 # 선이 흐려도 아주 얇은 단색 띠면 그 아래에서
+    bot = None
+    k = 0
+    while k < n and ui[n - 1 - k] and k < int(n * BOT_MAX) + 1:
+        k += 1
+    if k >= 2:
+        for L in range(n - 2, max(n - k - 2, 0), -1):
+            if edge[L - 1] >= LINE and all(ui[L + 1:]):
+                bot = L
+                break
+        if bot is None and k <= int(n * 0.05) and not ui[n - 1 - k]:
+            bot = n - k
+    return top, bot
+
+
 def _snap(pos, edge, n, lo_lim, hi_lim):
     """경계를 가장 강한 선(±2칸)에 맞춤. edge[i] 는 i 와 i+1 사이"""
     best, bv = pos, 0.0
@@ -119,10 +154,10 @@ def _window_rect(lay, w0, w1, h0=None, h1=None):
     cf = np.median(lay["cf"][w0:w1], axis=0) / 255.0
     re = np.median(lay["re"][w0:w1], axis=0) / 255.0
     ce = np.median(lay["ce"][w0:w1], axis=0) / 255.0
-    ys, xs = _motion_span(ra), _motion_span(ca)
+    ys, xs = _motion_span(ra, ROW_STILL), _motion_span(ca)
     if ys is None or xs is None:
         return None
-    y0, y1 = _expand(ys[0], ys[1], rf, rah, GH)
+    y0, y1 = _expand(ys[0], ys[1], rf, rah, GH, ROW_STILL)
     x0, x1 = _expand(xs[0], xs[1], cf, cah, GW)
     y0 = _snap(y0, re, GH, 0, ys[0])
     y1 = _snap(y1, re, GH, ys[1], GH)
@@ -134,6 +169,11 @@ def _window_rect(lay, w0, w1, h0=None, h1=None):
         y0 = max(y0, bt)
     if bb is not None:
         y1 = min(y1, bb)
+    tt, tb = _thin_bars(rf, rah, re, GH)
+    if tt is not None:
+        y0 = max(y0, tt)
+    if tb is not None:
+        y1 = min(y1, tb)
     bl, br = _bar_cut(xs[0], xs[1], cf, cah, ce, GW)
     if bl is not None:
         x0 = max(x0, bl)
@@ -160,6 +200,8 @@ def detect(a, info):
     nw = len(lay["ra"])
     W = int(info.get("disp_w") or info["width"])
     H = int(info.get("disp_h") or info["height"])
+    if H > W * 1.15:
+        return _detect_portrait(a, info, W, H)
     full = (0, 0, GW, GH)
     rects = []
     prev = full
@@ -203,9 +245,9 @@ def detect(a, info):
     for i, sg in enumerate(merged):
         arr = np.array(sg["all"])
         x0, y0, x1, y1 = np.median(arr, axis=0)
-        rx, ry = int(round(x0 * sx)) // 2 * 2, int(round(y0 * sy)) // 2 * 2
-        rw = (int(round(x1 * sx)) - rx) // 2 * 2
-        rh = (int(round(y1 * sy)) - ry) // 2 * 2
+        rx, ry = _even_up(x0 * sx), _even_up(y0 * sy)
+        rw = _even_down(x1 * sx) - rx
+        rh = _even_down(y1 * sy) - ry
         rw, rh = min(rw, W - rx), min(rh, H - ry)
         st = 0.0 if i == 0 else _switch_time(a, sg["w0"])
         en = dur if i == len(merged) - 1 else _switch_time(a, sg["w1"])
@@ -221,6 +263,35 @@ def detect(a, info):
     if all(_is_full(sg["rect"], W, H) for sg in final):
         plan["segs"] = []
     return plan
+
+
+def _detect_portrait(a, info, W, H):
+    """세로 녹화: 맨 위 상태바·맨 아래 내비바만 자름. 채팅 등 나머지는 절대 건드리지 않음.
+    영상 전체를 한꺼번에 보고 한 가지로 정함"""
+    lay = a.lay
+    ra = (np.percentile(lay["ra"], 90, axis=0) if len(lay["ra"]) > 3 else lay["ra"].max(axis=0)) / 255.0
+    rf = np.median(lay["rf"], axis=0) / 255.0
+    re = np.median(lay["re"], axis=0) / 255.0
+    top, bot = _thin_bars(rf, ra, re, GH)
+    y0 = top or 0
+    y1 = bot or GH
+    sy = H / GH
+    ry = _even_up(y0 * sy)
+    ye = _even_down(y1 * sy)
+    seg = {"start": 0.0, "end": info["duration"], "rect": [0, ry, W // 2 * 2, ye - ry], "on": True,
+           "portrait": True}
+    plan = {"W": W, "H": H, "segs": [seg]}
+    if _is_full(seg["rect"], W, H, tol=0.003):
+        plan["segs"] = []
+    return plan
+
+
+def _even_up(v):
+    return int(np.ceil(v / 2.0)) * 2
+
+
+def _even_down(v):
+    return int(np.floor(v / 2.0)) * 2
 
 
 def _switch_time(a, w):
@@ -293,8 +364,9 @@ def refine(path, info, plan, job=None):
             x = vline(x, y, y1)
         if x1 < W:
             x1 = vline(x1, y, y1)
-        x, y = x // 2 * 2, y // 2 * 2
-        w, h = max(2, min(W - x, x1 - x)) // 2 * 2, max(2, min(H - y, y1 - y)) // 2 * 2
+        x, y = _even_up(x), _even_up(y)          # 짝수 맞춤은 안쪽으로 (가장자리 한 줄 남지 않게)
+        x1, y1 = _even_down(min(W, x1)), _even_down(min(H, y1))
+        w, h = max(2, x1 - x), max(2, y1 - y)
         sg["rect"] = [x, y, w, h]
     return plan
 
@@ -430,10 +502,26 @@ def make_portrait_sample(path):
     rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
                               "-f", "lavfi", "-i", "testsrc2=s=540x512:r=24:d=20",
                               "-f", "lavfi", "-i", "life=s=440x620:mold=10:r=24:ratio=0.08:death_color=#202020:"
-                                                   "life_color=#bbbbbb,trim=duration=20",
+                                                   "life_color=#bbbbbb,trim=duration=10,"
+                                                   "tpad=stop_mode=clone:stop_duration=10",
                               "-f", "lavfi", "-i", "color=c=0x1a1a1a:s=540x1320:r=24:d=20",
                               "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
                               "-crf", "28", "-g", "48", "-pix_fmt", "yuv420p", path], timeout=180)
+    if rc != 0:
+        raise RuntimeError(err[-300:])
+
+
+def make_fold_full_sample(path):
+    """큰 화면 전체화면: 얇은 상태바(깜빡이는 빨간 표시) 바로 아래 영상, 영상 윗부분은 어둡고 가만히"""
+    graph = ("[0:v]drawbox=x=0:y=0:w=650:h=70:c=black@0.75:t=fill[vid];[1:v][vid]overlay=0:14,"
+             "drawbox=x=0:y=0:w=650:h=14:c=black:t=fill,drawbox=x=10:y=2:w=50:h=9:c=0xcc2222:t=fill:"
+             "enable='lt(mod(t\\,1)\\,0.5)',drawbox=x=70:y=3:w=20:h=8:c=white:t=fill,"
+             "drawbox=x=560:y=3:w=70:h=8:c=white:t=fill[v]")
+    rc, _, err = fftools.run([fftools.FFMPEG, "-v", "error", "-y", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=s=650x526:r=30:d=20",
+                              "-f", "lavfi", "-i", "color=c=black:s=650x540:r=30:d=20",
+                              "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "28", "-g", "60", "-pix_fmt", "yuv420p", path], timeout=180)
     if rc != 0:
         raise RuntimeError(err[-300:])
 
@@ -482,6 +570,13 @@ def selftest(log=print):
     act4 = active_segs(refine(src4, info4, detect(a4, info4)))
     log(f"portrait crop: {act4}")
     ok4 = len(act4) == 1 and all(abs(u - v) <= 6 for u, v in zip(act4[0][2], [0, 48, 540, 1212]))
-    ok = ok and ok2 and ok3 and ok4
+    src5 = os.path.join(d, "foldfull.mp4")
+    make_fold_full_sample(src5)
+    info5 = fftools.probe(src5)
+    a5 = analyzer.analyze(src5, info5, analyzer.DEFAULTS, use_cache=False)
+    act5 = active_segs(refine(src5, info5, detect(a5, info5)))
+    log(f"foldfull crop: {act5}")
+    ok5 = len(act5) == 1 and all(abs(u - v) <= 4 for u, v in zip(act5[0][2], [0, 14, 650, 526]))
+    ok = ok and ok2 and ok3 and ok4 and ok5
     log("crop ok" if ok else "crop FAIL")
     return ok
