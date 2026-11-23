@@ -298,6 +298,7 @@ def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc, crop=
     total_f = sum(n for _, n in chunks)
     done_f = sum(chunks[i][1] for i in done)
     hw_dec = settings.get("use_gpu", True) and enc == "hevc_nvenc"
+    hw_keep = hw_dec and not info.get("rotation")
     name = ENC_NAMES.get(enc, enc)
     for idx, (a, n) in enumerate(chunks):
         if idx in done:
@@ -316,7 +317,15 @@ def _encode_with(path, info, keeps, out, wd, settings, progress, job, enc, crop=
         cb = (lambda t, d=done_f, nn=n, lb=label: progress(min(1.0, (d + min(nn, max(0.0, t) * fps)) / total_f) * 0.95, lb)) \
             if progress else None
         rc, err = -1, ""
-        if hw_dec:
+        if hw_dec and hw_keep and not vfs[idx]:
+            # 크롭 없는 조각: 푼 그림을 그래픽카드 안에 둔 채 바로 인코딩 (CPU 왕복 없음, 결과·용량 동일)
+            gb = [x for x in body]
+            k = gb.index("-pix_fmt")
+            del gb[k:k + 2]
+            rc, err = job.run(["-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + gb, on_time=cb)
+            if rc != 0 and not job.cancelled:
+                hw_keep = False     # 안 되면 이후로는 예전 방식
+        if rc != 0 and hw_dec and not job.cancelled:
             rc, err = job.run(["-y", "-hwaccel", "cuda"] + body, on_time=cb)
             if rc != 0 and not job.cancelled:
                 hw_dec = False      # 그래픽카드 디코딩이 안 되면 이후로는 CPU 디코딩
