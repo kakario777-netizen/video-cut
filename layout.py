@@ -550,7 +550,7 @@ def get(path, info, a, job=None):
     """저장된 계획이 있으면 그것, 없으면 찾아서 저장"""
     p = load(path, int(a.fps))
     if p is not None:
-        manual = any(sg.get("manual") for sg in p.get("segs", []))
+        manual = any(sg.get("manual") for sg in p.get("segs", [])) or p.get("edited")
         if manual or p.get("lv") == LAYOUT_VERSION:
             return p                 # 직접 지정한 크롭은 그대로
     p = compute(path, info, a, job)

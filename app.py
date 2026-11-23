@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,6 +19,7 @@ import player as playmod
 import repair
 import layout
 import updater
+import history
 from version import VERSION
 
 APP_NAME = "비디오 컷"
@@ -253,6 +255,7 @@ class App:
         btn(top, "설정", lambda: SettingsDialog(self), "TButton").pack(side="right", padx=6)
         self.upd_btn = btn(top, "업데이트 확인", lambda: UpdateDialog(self), "TButton")
         self.upd_btn.pack(side="right")
+        btn(top, "변환 기록", self.open_log, "TButton").pack(side="right", padx=6)
 
         # 가운데: 프리뷰 + 오른쪽 패널
         mid = ttk.PanedWindow(r, orient="horizontal")
@@ -507,6 +510,7 @@ class App:
 
     def _save_crop(self):
         if self.path and self.analysis and self.crop:
+            self.crop["edited"] = True          # 손댄 크롭은 버전이 바뀌어도 다시 계산하지 않음
             layout.save(self.path, int(self.analysis.fps), self.crop)
 
     def _fit_panels(self):
@@ -754,6 +758,10 @@ class App:
                 self._qrow(it)
                 if changed or "out" in m[2]:
                     self._save_queue()          # 진행 상황 바로 저장
+        elif kind == "log_new":
+            w = getattr(self, "log_win", None)
+            if w is not None and w.winfo_exists():
+                w.reload()
         elif kind == "batch_done":
             self._batch_done(m[1], m[2])
         elif kind == "fix":
@@ -2065,8 +2073,15 @@ class App:
                     if act:
                         crop = {"W": plan["W"], "H": plan["H"], "segs": act}
                 part = (0.0, 1.0)
+                t_start = time.time()
                 msg = exporter.export(path, info, segs, out, mode, settings,
                                       progress=lambda r, m: prog(r, m, part=part), job=job, crop=crop)
+                try:
+                    ncut = sum(1 for sg in segs if sg.get("cut")) if isinstance(segs, list) else 0
+                    history.record(path, out, info, msg, ncut, crop, time.time() - t_start)
+                    self.post("log_new")
+                except Exception:
+                    pass
                 self.post("item", path, {"state": "done", "pct": 1.0, "out": out})
                 results.append((path, out, True, msg.splitlines()[0] + size_note(path, out)))
             except Exception as e:
@@ -2117,6 +2132,14 @@ class App:
                 subprocess.Popen(["xdg-open", os.path.dirname(path)])
         except Exception:
             pass
+
+    def open_log(self):
+        w = getattr(self, "log_win", None)
+        if w is not None and w.winfo_exists():
+            w.lift()
+            w.reload()
+            return
+        self.log_win = LogDialog(self)
 
     def on_close(self):
         if self.exporting and not messagebox.askyesno(
@@ -2296,6 +2319,169 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
         if self.app.analysis and messagebox.askyesno(APP_NAME, "바꾼 기준으로 지금 영상에서 다시 찾을까요?"):
             self.app.redetect()
+
+
+class LogDialog(tk.Toplevel):
+    """변환 기록: 날짜별로 쌓인 전·후 결과 (썸네일, 길이, 용량, 형식)"""
+    ROW, HEAD, TW, TH = 118, 40, 160, 90
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("변환 기록")
+        self.configure(bg=PANEL)
+        self.geometry(app.s.get("log_geometry", "1040x760"))
+        self.minsize(760, 400)
+        top = ttk.Frame(self, style="Panel.TFrame", padding=(14, 10))
+        top.pack(fill="x")
+        self.sum_lbl = ttk.Label(top, text="", style="Head.TLabel")
+        self.sum_lbl.pack(side="left")
+        ttk.Button(top, text="닫기", command=self._close).pack(side="right")
+        ttk.Button(top, text="기록 폴더 열기", command=self._open_dir).pack(side="right", padx=6)
+        ttk.Button(top, text="새로 고침", command=self.reload).pack(side="right")
+        ttk.Label(self, text="  두 번 클릭하면 결과 파일이 있는 폴더를 엽니다. (목록을 지우거나 프로그램을 다시 켜도 기록은 남습니다)",
+                  style="Panel.TLabel", foreground=SUB).pack(fill="x", padx=12)
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        self.cv = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.cv.bind("<MouseWheel>", lambda e: self.cv.yview_scroll(int(-e.delta / 40) or (-1 if e.delta > 0 else 1), "units"))
+        self.cv.bind("<Button-4>", lambda e: self.cv.yview_scroll(-3, "units"))
+        self.cv.bind("<Button-5>", lambda e: self.cv.yview_scroll(3, "units"))
+        self.cv.bind("<Double-Button-1>", self._dbl)
+        self.cv.bind("<Configure>", lambda e: self._draw() if abs(e.width - getattr(self, "_w", 0)) > 20 else None)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.imgs = {}
+        self.rows = []
+        self.reload()
+
+    def _close(self):
+        try:
+            self.app.s["log_geometry"] = self.geometry()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _open_dir(self):
+        try:
+            os.startfile(history.base_dir())
+        except Exception:
+            pass
+
+    def _img(self, name):
+        if not name:
+            return None
+        if name in self.imgs:
+            return self.imgs[name]
+        im = None
+        try:
+            from PIL import Image, ImageTk
+            src = Image.open(history.thumb_path(name)).convert("RGB")
+            src.thumbnail((self.TW, self.TH))            # 비율 그대로 (늘리지 않음)
+            box = Image.new("RGB", (self.TW, self.TH), (0, 0, 0))
+            box.paste(src, ((self.TW - src.width) // 2, (self.TH - src.height) // 2))
+            im = ImageTk.PhotoImage(box)
+        except Exception:
+            im = None
+        self.imgs[name] = im
+        return im
+
+    def reload(self):
+        self.items = history.load()
+        n = len(self.items)
+        a = sum(x.get("src_size", 0) for x in self.items)
+        b = sum(x.get("out_size", 0) for x in self.items)
+        cut = sum(max(0.0, x.get("src_dur", 0) - x.get("out_dur", 0)) for x in self.items)
+        self.sum_lbl.config(text=(f"전체 {n}개  ·  원본 {history.mb(a)} → 결과 {history.mb(b)}"
+                                  f"  ({max(0, 100 - b * 100 // max(1, a))}% 줄어듦)  ·  잘라낸 시간 {_hms(cut)}")
+                            if n else "아직 변환 기록이 없습니다. 내보내기가 끝날 때마다 여기에 쌓입니다.")
+        self._draw()
+        self.cv.update_idletasks()
+        self.cv.yview_moveto(1.0)                     # 가장 최근 것이 보이게
+
+    def _draw(self):
+        cv = self.cv
+        cv.delete("all")
+        self.rows = []
+        W = max(700, cv.winfo_width())
+        self._w = W
+        y = 6
+        by_day = {}
+        for e in self.items:
+            by_day.setdefault(e.get("time", "")[:10], []).append(e)
+        wk = "월화수목금토일"
+        for day in sorted(by_day):
+            es = by_day[day]
+            try:
+                dname = wk[time.strptime(day, "%Y-%m-%d").tm_wday]
+            except Exception:
+                dname = ""
+            a = sum(x.get("src_size", 0) for x in es)
+            b = sum(x.get("out_size", 0) for x in es)
+            cv.create_rectangle(0, y, W, y + self.HEAD - 6, fill=PANEL2, outline="")
+            cv.create_text(14, y + (self.HEAD - 6) // 2, anchor="w", fill=ACCENT, font=FONT_B,
+                           text=f"{day} ({dname})   ·   {len(es)}개   ·   {history.mb(a)} → {history.mb(b)}")
+            y += self.HEAD
+            for e in es:
+                self._row(e, y, W)
+                y += self.ROW
+        cv.configure(scrollregion=(0, 0, W, max(y, 10)))
+
+    def _row(self, e, y, W):
+        cv = self.cv
+        cv.create_rectangle(0, y, W, y + self.ROW - 8, fill=PANEL, outline="")
+        x = 12
+        ty = y + (self.ROW - 8 - self.TH) // 2
+        for k, lab in (("th_src", "전"), ("th_out", "후")):
+            im = self._img(e.get(k))
+            cv.create_rectangle(x, ty, x + self.TW, ty + self.TH, fill="black", outline=LINE)
+            if im:
+                cv.create_image(x, ty, anchor="nw", image=im)
+            cv.create_text(x + 4, ty + 3, anchor="nw", text=lab, fill="white", font=FONT_S)
+            x += self.TW + 8
+        x += 8
+        sd, od = e.get("src_dur", 0), e.get("out_dur", 0)
+        ss, os_ = e.get("src_size", 0), e.get("out_size", 0)
+        name = os.path.basename(e.get("src", ""))
+        cv.create_text(x, y + 10, anchor="nw", text=name, fill=TEXT, font=FONT_B, width=W - x - 110)
+        cv.create_text(W - 14, y + 10, anchor="ne", text=e.get("time", "")[11:16], fill=SUB, font=FONT_S)
+        extra = f"  ({_hms(max(0.0, sd - od))} 잘림" + (f", {e['cuts']}곳" if e.get("cuts") else "") + ")"
+        lines = [
+            (f"길이   {_hms(sd)} → {_hms(od)}{extra if sd - od >= 0.5 else ''}", TEXT),
+            (f"용량   {history.mb(ss)} → {history.mb(os_)}   ({max(0, 100 - os_ * 100 // max(1, ss))}% 줄어듦)", ACCENT),
+            (f"형식   {e.get('src_fmt', '')} → {e.get('out_fmt', '')}" + ("   ·   크롭" if e.get("crop") else "")
+             + (f"   ·   걸린 시간 {_hms(e['elapsed'])}" if e.get("elapsed") else ""), SUB),
+            (e.get("out", ""), SUB),
+        ]
+        yy = y + 32
+        for t, c in lines:
+            cv.create_text(x, yy, anchor="nw", text=t, fill=c, font=FONT_S, width=W - x - 20)
+            yy += 18
+        self.rows.append((y, y + self.ROW, e))
+
+    def _dbl(self, ev):
+        yy = self.cv.canvasy(ev.y)
+        for a, b, e in self.rows:
+            if a <= yy < b:
+                out = e.get("out", "")
+                try:
+                    if os.path.isfile(out):
+                        subprocess.Popen(["explorer", "/select,", os.path.normpath(out)])
+                    elif os.path.isdir(os.path.dirname(out)):
+                        os.startfile(os.path.dirname(out))
+                except Exception:
+                    pass
+                return
+
+
+def _hms(sec):
+    sec = int(round(sec or 0))
+    h, r = divmod(sec, 3600)
+    m, s_ = divmod(r, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
 
 
 class UpdateDialog(tk.Toplevel):
@@ -2526,14 +2712,23 @@ def _ui_test(app, root):
     manual_ok = manual_ok and reload and reload["segs"][0].get("manual")
     app.crop_all_off()
     manual_ok = manual_ok and layout.rect_at(app.crop, 5.0) is None
+    # 변환 기록: 앞에서 내보낸 것들이 쌓였는지, 창이 그려지는지
+    hist = history.load()
+    app.open_log()
+    pump(1.0)
+    log_ok = len(hist) >= 2 and bool(app.log_win.rows) and all(os.path.isfile(history.thumb_path(h["th_out"]))
+                                                               for h in hist if h.get("th_out")) \
+        and hist[-1].get("out_size", 0) > 0
+    print("history:", len(hist), [(h.get("src_dur"), h.get("out_dur"), h.get("th_src"), h.get("out_fmt")) for h in hist[-2:]], flush=True)
+    app.log_win._close()
     # 복구 화면 전환
     app.show_page("fix")
     pump(0.3)
     app.show_page("edit")
     pump(0.3)
     print(f"checks drag={drag_ok} scrub={scrub_ok} play={play_ok} tree={tree_ok} batch={batch_ok} "
-          f"pause={paused_ok} stop={stop_ok} btn={btn_ok} resume={resume_ok} manual_crop={manual_ok}", flush=True)
-    return all((drag_ok, scrub_ok, play_ok, tree_ok, batch_ok, paused_ok, stop_ok, btn_ok, resume_ok, manual_ok))
+          f"pause={paused_ok} stop={stop_ok} btn={btn_ok} resume={resume_ok} manual_crop={manual_ok} log={log_ok}", flush=True)
+    return all((drag_ok, scrub_ok, play_ok, tree_ok, batch_ok, paused_ok, stop_ok, btn_ok, resume_ok, manual_ok, log_ok))
 
 
 def main():
