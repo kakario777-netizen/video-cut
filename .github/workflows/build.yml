@@ -3,6 +3,7 @@ name: 윈도우 프로그램 빌드
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", ".gitignore"]     # 설명 문서만 바뀌면 빌드·릴리스 안 함
   workflow_dispatch:
 
 permissions:
@@ -16,6 +17,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
+          cache: pip
           python-version: "3.12"
 
       - name: 버전 정하기

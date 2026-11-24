@@ -32,6 +32,10 @@ def latest_release(timeout=15):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.load(r)
     asset = next((a for a in data.get("assets", []) if a.get("name") == SETUP), None)
+    # 내 저장소 릴리스의 HTTPS 주소만 받음 (다른 곳에서 받는 일 없게)
+    if asset and not str(asset.get("browser_download_url", "")).startswith(
+            f"https://github.com/{REPO}/releases/download/"):
+        asset = None
     return {"tag": data.get("tag_name", ""), "notes": data.get("body") or "",
             "url": asset["browser_download_url"] if asset else None, "size": asset["size"] if asset else 0}
 
