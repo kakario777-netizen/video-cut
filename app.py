@@ -460,6 +460,7 @@ class App:
         self.tl.bind("<ButtonRelease-1>", self._tl_release)
         self.tl.bind("<Motion>", self._tl_hover)
         self.tl.bind("<Double-Button-1>", lambda e: self._set_view(0, self._dur()))
+        self.tl.bind("<Button-3>", self._tl_menu)
         self.tl.bind("<MouseWheel>", self._tl_wheel)
         self.tl.bind("<Shift-MouseWheel>", lambda e: self._pan(-1 if e.delta > 0 else 1))
         self.tl.bind("<Button-4>", lambda e: self._zoom_at(e.x, 0.8))
@@ -1297,6 +1298,8 @@ class App:
         self.pause()
         self.crop_draw = not self.crop_draw
         self.draw_start = None
+        if not self.crop_draw:
+            self.crop_target = None
         self.crop_btn.config(text="크롭 지정 취소" if self.crop_draw else "크롭 직접 지정")
         if self.crop_draw:
             self.status("프리뷰 화면에서 남길 영역(영상+블러)을 마우스로 끌어 그리세요. 그 밖은 검은색이 됩니다.")
@@ -1338,10 +1341,15 @@ class App:
         if self.crop is None:
             self.crop = {"W": W0, "H": H0, "segs": []}
         dur = self._dur()
-        cur = next((sg for sg in self.crop["segs"] if sg["start"] <= self.t < sg["end"]
-                    and not layout._is_full(sg["rect"], W0, H0)), None)
+        target = getattr(self, "crop_target", None)
+        self.crop_target = None
+        cur = target if target in self.crop["segs"] else \
+            next((sg for sg in self.crop["segs"] if sg["start"] <= self.t < sg["end"]
+                  and not layout._is_full(sg["rect"], W0, H0)), None)
         whole = True
-        if cur is not None and len(self.crop["segs"]) > 1:
+        if target is not None and cur is target:
+            whole = False
+        elif cur is not None and len(self.crop["segs"]) > 1:
             ans = messagebox.askyesnocancel(
                 APP_NAME, f"이 영역을 어디에 적용할까요?\n\n예: 영상 전체\n아니요: 지금 크롭 구간만 "
                           f"({fftools.fmt_time(cur['start'])} ~ {fftools.fmt_time(cur['end'])})")
@@ -1372,7 +1380,7 @@ class App:
         self._save_crop()
         self.draw_timeline()
         self.show_at(self.t)
-        self.status("이 영상의 크롭을 모두 껐습니다. (타임라인 크롭 줄을 클릭하면 구간별로 다시 켤 수 있어요)")
+        self.status("이 영상의 크롭을 모두 껐습니다. (타임라인 크롭 줄을 클릭하면 구간별로 다시 켤 수 있어요 · 오른쪽 클릭: 나누기·합치기·다시 그리기)")
 
     def _display_loop(self):
         try:
@@ -1839,6 +1847,14 @@ class App:
         if not self.info or self.drag:
             return
         hit = self._edge_hit(e.x, e.y)
+        on_crop = CROP_Y - 2 <= e.y <= CROP_Y + CROP_H + 2
+        if not hit and on_crop and self.crop:
+            hit = self._crop_edge_hit(e.x)
+        if on_crop and not getattr(self, "_crop_hint", False):
+            self._crop_hint = True
+            self.status("크롭 줄: 클릭 = 켜기/끄기 · 경계 끌기 = 구간 조정 · 오른쪽 클릭 = 나누기·합치기·영역 다시 그리기·새 구간")
+        elif not on_crop:
+            self._crop_hint = False
         self.tl.config(cursor="sb_h_double_arrow" if hit else ("hand2" if e.y < RULER_H else ""))
 
     def _tl_press(self, e):
@@ -1847,6 +1863,11 @@ class App:
         self.tl.focus_set()
         self.pause()
         if CROP_Y - 2 <= e.y <= CROP_Y + CROP_H + 2 and self.crop:
+            ch = self._crop_edge_hit(e.x)
+            if ch:
+                self.drag = ("cedge",) + ch
+                self.show_at(ch[0], fast=True)
+                return
             t = self._t(e.x)
             for sg in self.crop.get("segs", []):
                 if sg["start"] <= t < sg["end"] and not layout._is_full(sg["rect"], self.crop["W"], self.crop["H"]):
@@ -1888,6 +1909,24 @@ class App:
         if self.drag[0] == "scrub":
             self.show_at(t, fast=True)
             return
+        if self.drag[0] == "cedge":
+            _, t0, left, right = self.drag
+            lo = (left["start"] + 0.5) if left else max([g["end"] for g in self.crop["segs"]
+                                                          if g is not right and g["end"] <= t0 + 1e-6] + [0.0])
+            hi = (right["end"] - 0.5) if right else min([g["start"] for g in self.crop["segs"]
+                                                          if g is not left and g["start"] >= t0 - 1e-6] + [d])
+            nt = round(min(max(t, lo), hi), 2)
+            if left:
+                left["end"] = nt
+                left["manual"] = True
+            if right:
+                right["start"] = nt
+                right["manual"] = True
+            self.drag = ("cedge", nt, left, right)
+            self.draw_timeline()
+            self.show_at(nt, fast=True)
+            self.status(f"크롭 구간 경계 {fftools.fmt_time(nt, True)}")
+            return
         _, seg, which = self.drag
         idx = self.segs.index(seg)
         lo = self.segs[idx - 1]["end"] if idx > 0 else 0.0
@@ -1908,7 +1947,137 @@ class App:
         if self.drag and self.drag[0] == "edge":
             seg = self.drag[1]
             self._changed(seg)
+        elif self.drag and self.drag[0] == "cedge":
+            self._save_crop()
         self.drag = None
+
+    # ── 크롭 구간 손보기 ──
+    def _crop_segs(self):
+        if not self.crop:
+            return []
+        self.crop["segs"].sort(key=lambda g: g["start"])
+        return self.crop["segs"]
+
+    def _crop_edge_hit(self, x):
+        """크롭 줄에서 구간 끝/시작 가까이(6px) → (경계 시각, 왼쪽 구간, 오른쪽 구간)"""
+        segs = self._crop_segs()
+        W0, H0 = self.crop["W"], self.crop["H"]
+        vis = [g for g in segs if not layout._is_full(g["rect"], W0, H0)]
+        best = None
+        for g in vis:
+            for which in ("start", "end"):
+                tt = g[which]
+                dx = abs(self._x(tt) - x)
+                if dx <= 6 and (best is None or dx < best[0]):
+                    best = (dx, tt)
+        if best is None:
+            return None
+        tt = best[1]
+        left = next((g for g in segs if abs(g["end"] - tt) < 0.02), None)
+        right = next((g for g in segs if abs(g["start"] - tt) < 0.02), None)
+        if left is not None and layout._is_full(left["rect"], W0, H0) and right is not None:
+            left = None if abs(tt) < 1e-6 else left
+        if tt <= 0.01 and right is not None:
+            left = None
+        if tt >= self._dur() - 0.01:
+            right = None
+        if left is None and right is None:
+            return None
+        return (tt, left, right)
+
+    def _tl_menu(self, e):
+        if not self.info or not (CROP_Y - 4 <= e.y <= CROP_Y + CROP_H + 4):
+            return
+        if self.analysis is None:
+            return
+        self.pause()
+        t = min(max(0.0, self._t(e.x)), self._dur())
+        if self.crop is None:
+            W0, H0 = self._crop_wh()
+            self.crop = {"W": W0, "H": H0, "segs": []}
+        segs = self._crop_segs()
+        W0, H0 = self.crop["W"], self.crop["H"]
+        sg = next((g for g in segs if g["start"] <= t < g["end"] and not layout._is_full(g["rect"], W0, H0)), None)
+        m = tk.Menu(self.root, tearoff=0, bg=PANEL2, fg=TEXT, activebackground=ACCENT_D, activeforeground="white")
+        if sg is not None:
+            i = segs.index(sg)
+            prev = segs[i - 1] if i > 0 else None
+            nxt = segs[i + 1] if i + 1 < len(segs) else None
+            m.add_command(label=f"여기서 구간 나누기 ({fftools.fmt_time(t)})", command=lambda: self._crop_split(sg, t))
+            m.add_command(label="이 구간 영역 다시 그리기", command=lambda: self._crop_redraw(sg, t))
+            m.add_command(label="이 구간 크롭 끄기" if sg.get("on", True) else "이 구간 크롭 켜기",
+                          command=lambda: self._crop_toggle(sg))
+            m.add_separator()
+            m.add_command(label="앞 구간과 합치기 (이 구간 영역으로)", command=lambda: self._crop_merge(sg, prev),
+                          state="normal" if prev is not None else "disabled")
+            m.add_command(label="뒤 구간과 합치기 (이 구간 영역으로)", command=lambda: self._crop_merge(sg, nxt),
+                          state="normal" if nxt is not None else "disabled")
+            m.add_separator()
+            m.add_command(label="이 구간 지우기 (크롭 안 함)", command=lambda: self._crop_delete(sg))
+        else:
+            m.add_command(label="여기에 크롭 구간 만들기", command=lambda: self._crop_new(t))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _crop_done(self, msg, t=None):
+        self._save_crop()
+        self.crop_var.set(True)
+        self.draw_timeline()
+        self.show_at(self.t if t is None else t)
+        self.status(msg)
+
+    def _crop_split(self, sg, t):
+        if t - sg["start"] < 0.5 or sg["end"] - t < 0.5:
+            self.status("구간 끝에 너무 가까워서 나눌 수 없습니다.")
+            return
+        new = dict(sg)
+        new["rect"] = list(sg["rect"])
+        new["start"] = round(t, 2)
+        sg["end"] = round(t, 2)
+        sg["manual"] = new["manual"] = True
+        self.crop["segs"].append(new)
+        self._crop_done(f"{fftools.fmt_time(t)}에서 크롭 구간을 나눴습니다. 오른쪽 클릭 → '영역 다시 그리기'로 따로 지정하세요.", t)
+
+    def _crop_redraw(self, sg, t):
+        self.show_at(min(max(t, sg["start"]), sg["end"] - 0.05))
+        self.crop_draw = False
+        self.toggle_crop_draw()
+        self.crop_target = sg
+        self.status(f"{fftools.fmt_time(sg['start'])}~{fftools.fmt_time(sg['end'])} 구간에 쓸 영역을 프리뷰에서 끌어 그리세요.")
+
+    def _crop_toggle(self, sg):
+        sg["on"] = not sg.get("on", True)
+        self._crop_done(f"이 구간 크롭을 {'켰습니다' if sg['on'] else '껐습니다'}.")
+
+    def _crop_merge(self, sg, other):
+        if other is None:
+            return
+        sg["start"], sg["end"] = min(sg["start"], other["start"]), max(sg["end"], other["end"])
+        sg["manual"] = True
+        self.crop["segs"].remove(other)
+        self._crop_done(f"구간을 합쳤습니다 ({fftools.fmt_time(sg['start'])} ~ {fftools.fmt_time(sg['end'])}).")
+
+    def _crop_delete(self, sg):
+        self.crop["segs"].remove(sg)
+        self._crop_done("이 구간은 크롭하지 않습니다.")
+
+    def _crop_new(self, t):
+        segs = self._crop_segs()
+        W0, H0 = self.crop["W"], self.crop["H"]
+        real = [g for g in segs if not layout._is_full(g["rect"], W0, H0)]
+        a = max([g["end"] for g in real if g["end"] <= t] + [0.0])
+        b = min([g["start"] for g in real if g["start"] > t] + [self._dur()])
+        # 겹치는 '전체 화면' 구간은 정리
+        self.crop["segs"] = [g for g in segs if not (layout._is_full(g["rect"], W0, H0)
+                                                    and g["start"] < b and g["end"] > a)]
+        near = min(real, key=lambda g: min(abs(g["start"] - t), abs(g["end"] - t)), default=None)
+        rect = list(near["rect"]) if near else [0, 0, W0 // 2 * 2, H0 // 2 * 2]
+        new = {"start": round(a, 2), "end": round(b, 2), "rect": rect, "on": True, "manual": True}
+        self.crop["segs"].append(new)
+        self._crop_done("크롭 구간을 만들었습니다.", t)
+        self._crop_redraw(new, t)
 
     # ════════════════ 저장 ════════════════
     def pick_dir(self):
@@ -2710,6 +2879,23 @@ def _ui_test(app, root):
         abs(cs[0]["rect"][2] - W0 * 0.5) <= W0 * 0.03 and layout.rect_at(app.crop, 5.0) is not None
     reload = layout.load(app.path, int(app.analysis.fps))
     manual_ok = manual_ok and reload and reload["segs"][0].get("manual")
+    # 크롭 구간 손보기: 나누기 → 경계 끌기 → 합치기
+    seg0 = app.crop["segs"][0]
+    app._crop_split(seg0, 10.0)
+    two = len(app.crop["segs"]) == 2
+    L, R = sorted(app.crop["segs"], key=lambda g: g["start"])
+    app.drag = ("cedge", 10.0, L, R)
+    ev2 = type("E", (), {})()
+    ev2.x, ev2.y = app._x(12.0), CROP_Y + 3
+    app._tl_motion(ev2)
+    app._tl_release(ev2)
+    moved = abs(L["end"] - 12.0) < 0.3 and abs(R["start"] - L["end"]) < 1e-6
+    saved_split = layout.load(app.path, int(app.analysis.fps))
+    app._crop_merge(R, L)
+    merged = len(app.crop["segs"]) == 1
+    cseg_ok = two and moved and merged and saved_split and len(saved_split["segs"]) == 2
+    print("crop seg edit:", two, moved, merged, flush=True)
+    manual_ok = manual_ok and cseg_ok
     app.crop_all_off()
     manual_ok = manual_ok and layout.rect_at(app.crop, 5.0) is None
     # 변환 기록: 앞에서 내보낸 것들이 쌓였는지, 창이 그려지는지
