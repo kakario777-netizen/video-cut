@@ -8,7 +8,7 @@ import tempfile
 import time
 import urllib.request
 
-REPO = "kakario777-netizen/video-cut"
+REPO = "kakario777-netizen/video-cut-release"   # 공개 릴리스 저장소 (코드는 비공개 저장소)
 SETUP = "VideoCut_Setup.exe"
 WORK = os.path.join(tempfile.gettempdir(), "VideoCut_update")
 
